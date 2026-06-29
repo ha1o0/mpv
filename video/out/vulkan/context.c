@@ -63,6 +63,11 @@ static inline OPT_STRING_VALIDATE_FUNC(vk_validate_dev)
         goto done;
 
     struct bstr param = bstr0(*value);
+    if (!param.len) {
+        mp_err(log, "No Vulkan device specified.\n");
+        ret = M_OPT_INVALID;
+        goto done;
+    }
     bool help = bstr_equals0(param, "help");
     if (help)
         mp_info(log, "Available vulkan devices:\n");
@@ -191,7 +196,9 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
      * of the ffmpeg Vulkan hwcontext and video decoding capability.
      */
     const char *opt_extensions[] = {
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 26, 0)
         VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
+#endif
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
         VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
         VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
@@ -332,16 +339,22 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
        .dynamicRendering = true,
     };
 
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 26, 0)
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer_feature = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
         .pNext = &dynamic_rendering_feature,
         .descriptorBuffer = true,
         .descriptorBufferPushDescriptors = true,
     };
+#endif
 
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float_feature = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 26, 0)
         .pNext = &descriptor_buffer_feature,
+#else
+        .pNext = &dynamic_rendering_feature,
+#endif
         .shaderBufferFloat32Atomics = true,
         .shaderBufferFloat32AtomicAdd = true,
     };
@@ -350,6 +363,11 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = &atomic_float_feature,
         .scalarBlockLayout = true,
+        .shaderUniformBufferArrayNonUniformIndexing = true,
+        .shaderSampledImageArrayNonUniformIndexing = true,
+        .shaderStorageBufferArrayNonUniformIndexing = true,
+        .shaderStorageImageArrayNonUniformIndexing = true,
+        .runtimeDescriptorArray = true,
         .shaderBufferInt64Atomics = true,
         .uniformBufferStandardLayout = true,
     };
@@ -565,10 +583,19 @@ static pl_color_space_t target_csp(struct ra_swapchain *sw)
     return (pl_color_space_t){0};
 }
 
+static float target_ref_luma(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    if (p->params.preferred_ref_luma)
+        return p->params.preferred_ref_luma(sw->ctx);
+    return 0;
+}
+
 static const struct ra_swapchain_fns vulkan_swapchain = {
     .color_depth   = color_depth,
     .set_color     = set_color,
     .target_csp    = target_csp,
+    .target_ref_luma = target_ref_luma,
     .start_frame   = start_frame,
     .submit_frame  = submit_frame,
     .swap_buffers  = swap_buffers,

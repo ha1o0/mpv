@@ -1842,8 +1842,8 @@ Video
     You can get the list of allowed codecs with ``mpv --vd=help``. Remove the
     prefix, e.g. instead of ``lavc:h264`` use ``h264``.
 
-    By default, this is set to ``h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx``. Note that
-    the hardware acceleration special codecs like ``h264_vdpau`` are not
+    By default, this is set to ``h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx,apv``.
+    Note that the hardware acceleration special codecs like ``h264_vdpau`` are not
     relevant anymore, and in fact have been removed from FFmpeg in this form.
 
     This is usually only needed with broken GPUs, where a codec is reported
@@ -3488,7 +3488,7 @@ Window
     :level:   A level as integer.
 
 ``--focus-on=<never|open|all>``,
-    (macOS only)
+    (X11 and macOS only)
     Focus the video window and make it the front most window on specific events (default: open).
 
     :never: Never focus the window on open or new file load events.
@@ -4396,9 +4396,10 @@ Demuxer
     ``--shuffle``, and like ``lazy`` otherwise.
 
 ``--directory-filter-types=<video,audio,image,archive,playlist>``
-    Media file types to filter when opening directory. To have all files added
-    to the playlist, clear the list using ``--directory-filter-types-clr``.
-    (Default: ``video,audio,image,archive,playlist``)
+    Media file types to filter when opening directories and archives. To have
+    all files added to the playlist, clear the list using
+    ``--directory-filter-types-clr``. (Default:
+    ``video,audio,image,archive,playlist``)
 
     This is a string list option. See `List Options`_ for details.
 
@@ -5307,7 +5308,7 @@ libavfilter, within the system audio API resampler, or any other places).
 
 ``--audio-resample-max-output-size=<length>``
     Limit maximum size of audio frames filtered at once, in ms (default: 40).
-    The output size size is limited in order to make resample speed changes
+    The output size is limited in order to make resample speed changes
     react faster. This is necessary especially if decoders or filters output
     very large frame sizes (like some lossless codecs or some DRC filters).
     This option does not affect the resampling algorithm in any way.
@@ -5425,11 +5426,7 @@ Terminal
     line. Expands properties. See `Property Expansion`_.
 
 ``--term-title=<string>``
-    Set the terminal title. Currently, this simply concatenates the escape
-    sequence setting the window title with the provided (property expanded)
-    string. This will mess up if the expanded string contain bytes that end the
-    escape sequence, or if the terminal does not understand the sequence. The
-    latter probably includes the regrettable win32.
+    Set the terminal title.
 
     Expands properties. See `Property Expansion`_.
 
@@ -5666,9 +5663,16 @@ Network
     Certificate authority database file for use with TLS. (Silently fails with
     older FFmpeg versions.)
 
-``--tls-verify``
-    Verify peer certificates when using TLS (e.g. with ``https://...``).
-    (Silently fails with older FFmpeg versions.)
+``--tls-verify=<yes|no>``
+    Verify peer certificates when using TLS (e.g. with ``https://...``)
+    (default: yes*). Disabling this option allows man-in-the-middle attacks
+    to silently substitute the content of an HTTPS stream and is only
+    recommended as a per-stream override when verification fails for a
+    known-good reason (e.g. an outdated CA bundle, a corporate proxy, a
+    development server with a self-signed certificate).
+
+    This is disabled by default, if mpv is built without libcurl and
+    libavformat is older than 63.0.100.
 
 ``--tls-cert-file``
     A file containing a certificate to use in the handshake with the
@@ -5747,14 +5751,12 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
 ``--curl-enabled=<yes|no>``
     Enable the libcurl-based network backend (default: ``yes``).
 
-    Defaults to ``no`` with libavformat < 62.15.101, which has a nested IO
+    Defaults to ``no`` on known older FFmpeg versions, which have a nested IO
     cleanup bug that can cause crashes or memory leaks. The issue happens only
-    on transfer failures or aborts, can be enabled if you don't mind possible
-    stability issues.
+    on transfer failures or aborts.
 
 ``--curl-http-version=<auto|1.0|1.1|2|2tls|2-prior-knowledge|3|3only>``
     Select the maximum HTTP protocol version libcurl is allowed to negotiate.
-    If libcurl was built without HTTP/3 support, it will fallback to ``auto``.
     (default: ``auto``, i.e. let libcurl pick)
 
 ``--curl-max-redirects=<0-100>``
@@ -7530,11 +7532,15 @@ them.
     encoding into the target colorspace, so after the application of
     ``--target-trc``. (Only for ``--vo=gpu-next``)
 
-``--hdr-reference-white=<auto|10-1000000>``
+``--hdr-reference-white=<auto|10-10000>``
     Specifies the assumed peak brightness of the mastering display for SDR
     content, in cd/m² (nits). This is used as HDR diffuse white level for SDR
     content. Essentially this is the SDR brightness in HDR container.
-    Default is 203 cd/m². (Only for ``--vo=gpu-next``)
+    (Only for ``--vo=gpu-next``)
+
+    In ``auto`` mode (default), the reference white luminance is queried from
+    the system. This is currently only supported on Windows. If the system does
+    not provide a value, 203 cd/m² is assumed.
 
     .. note::
 

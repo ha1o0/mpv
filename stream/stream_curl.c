@@ -27,6 +27,7 @@
 #include <libavutil/avstring.h>
 #include <libavutil/error.h>
 #include <libavutil/mem.h>
+#include <libavutil/opt.h>
 
 #include "stream.h"
 #include "stream_curl.h"
@@ -35,6 +36,7 @@
 #include "common/global.h"
 #include "common/msg.h"
 #include "cookies.h"
+#include "demux/avio_crypto.h"
 #include "demux/demux.h"
 #include "misc/bstr.h"
 #include "misc/dispatch.h"
@@ -65,6 +67,14 @@ static const struct curl_scheme curl_schemes[] = {
     {bstr0_lit("ftps"), MP_CURL_PROTO_FTP},
 };
 
+// Special args for use by lavf. Matches lavf/http.c "offset"/"end_offset" opts.
+// `offset` is the inclusive starting byte.
+// `end_offset` is the exclusive upper bound (0 = unbounded).
+struct curl_open_args {
+    int64_t offset;
+    int64_t end_offset;
+};
+
 struct curl_opts {
     bool enabled;
     int http_version;
@@ -75,12 +85,14 @@ struct curl_opts {
     int64_t max_request_size;
 };
 
-#ifndef CURL_HTTP_VERSION_3
-#define CURL_HTTP_VERSION_3 CURL_HTTP_VERSION_NONE
-#endif
-
-#ifndef CURL_HTTP_VERSION_3ONLY
-#define CURL_HTTP_VERSION_3ONLY CURL_HTTP_VERSION_NONE
+// Older lavf has a bug with nested IO cleanup, so don't enable curl by default.
+// <https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/23082>
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 15, 101)
+#define CURL_BY_DEFAULT
+#elif LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 12, 102) && LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(62, 13, 0)
+#define CURL_BY_DEFAULT /* 8.1 backport */
+#elif LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 3, 103) && LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(62, 4, 0)
+#define CURL_BY_DEFAULT /* 8.0 backport */
 #endif
 
 #define OPT_BASE_STRUCT struct curl_opts
@@ -107,9 +119,9 @@ const struct m_sub_options curl_conf = {
         {0}
     },
     .defaults = &(const struct curl_opts) {
-        // Older lavf has a bug with nested IO cleanup, disable by default.
-        // <https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/23082>
-        .enabled = LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 15, 101),
+#ifdef CURL_BY_DEFAULT
+        .enabled = true,
+#endif
         .http_version = CURL_HTTP_VERSION_NONE,
         .max_redirects = 16,
         .max_retries = 5,
@@ -150,6 +162,7 @@ struct priv {
     CURL *curl;
     struct curl_slist *headers;
     char *url;
+    const char *effective_url;
     const struct curl_scheme *scheme;
 
     // Stream parameters
@@ -159,6 +172,7 @@ struct priv {
     // Producer state. Only touched by the curl thread.
     uint64_t request_start;    // absolute byte position of next request
     uint64_t request_received; // bytes received in the current request
+    uint64_t request_end;      // exclusive byte cap (0 = unbounded)
     int retry_count;           // consecutive failed attempts at request_start
     bool active;               // handle is currently active in the multi
     bool finished;             // current request has reached EOF
@@ -177,6 +191,7 @@ struct priv {
     bool stream_eof;     // producer has delivered all data
     bool stream_error;   // unrecoverable error
     atomic_bool aborted; // canceled by user (mp_cancel)
+    struct mp_icy *icy;  // ICY metadata state, dormant until Icy-MetaInt seen
 };
 
 // Curl thread
@@ -346,6 +361,18 @@ static bool is_http_success(long resp)
     return resp >= 200 && resp < 300;
 }
 
+// Append `len` bytes to the ring buffer. Caller must hold p->mtx and have
+// verified that there is enough free space.
+static void ring_write(void *ctx, const char *data, size_t len)
+{
+    struct priv *p = ctx;
+    size_t tail_chunk = MPMIN(p->buffer_size - p->tail, len);
+    memcpy(p->buffer + p->tail, data, tail_chunk);
+    memcpy(p->buffer, data + tail_chunk, len - tail_chunk);
+    p->tail = (p->tail + len) % p->buffer_size;
+    p->count += len;
+}
+
 // Called per chunk of body data.
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
@@ -370,13 +397,9 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
         return CURL_WRITEFUNC_PAUSE;
     }
 
-    size_t tail_chunk = MPMIN(p->buffer_size - p->tail, bytes);
-    memcpy(p->buffer + p->tail, ptr, tail_chunk);
-    memcpy(p->buffer, ptr + tail_chunk, bytes - tail_chunk);
-    p->tail = (p->tail + bytes) % p->buffer_size;
-    p->count += bytes;
-    p->paused = false;
+    mp_icy_process(p->icy, ptr, bytes, ring_write, p);
 
+    p->paused = false;
     p->request_received += bytes;
 
     mp_cond_broadcast(&p->cond);
@@ -434,8 +457,18 @@ static void finalize_probe(struct priv *p)
 // we care about the final one.
 static void probe_http(struct priv *p, struct bstr line)
 {
-    if (line.len > 0)
+    if (line.len > 0) {
+        // A new status line resets per-response state so that intermediate
+        // 1xx/3xx responses don't leak ICY metadata into the final one.
+        mp_mutex_lock(&p->mtx);
+        if (bstr_startswith0(line, "HTTP/")) {
+            mp_icy_reset(p->icy);
+        } else {
+            mp_icy_add_header(p->icy, line);
+        }
+        mp_mutex_unlock(&p->mtx);
         return;
+    }
 
     long resp = 0;
     curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
@@ -455,8 +488,10 @@ static void probe_http(struct priv *p, struct bstr line)
     bool accept_ranges = ar && strcasecmp(ar, "bytes") == 0;
 
     // Some servers reply 200 to an open-ended "Range: 0-" but 206 to explicit
-    // byte ranges, so trust either.
-    p->seekable = !compressed && (resp == 206 || accept_ranges);
+    // byte ranges, so trust either. ICY metadata is interleaved with the body,
+    // so byte ranges from the server don't line up with consumer offsets.
+    p->seekable = !compressed && !mp_icy_active(p->icy) &&
+                  (resp == 206 || accept_ranges);
 
     if (p->seekable) {
         // Content-Range carries the full size on a partial response. On any
@@ -570,8 +605,11 @@ static void start_request(struct priv *p)
 
     bool ranged = !p->probed || p->seekable;
     bool chunked = ranged && p->opts->max_request_size > 0;
+    bool capped = ranged && p->request_end > 0;
 
-    if (p->seekable && p->content_size > 0 && start >= p->content_size) {
+    bool past_size = p->seekable && p->content_size > 0 && start >= p->content_size;
+    bool past_end = capped && start >= p->request_end;
+    if (past_size || past_end) {
         p->finished = true;
         mp_mutex_lock(&p->mtx);
         p->stream_eof = true;
@@ -581,10 +619,14 @@ static void start_request(struct priv *p)
     }
 
     char range[64];
-    if (chunked) {
-        uint64_t end = start + p->opts->max_request_size - 1;
+    if (chunked || capped) {
+        uint64_t end = UINT64_MAX;
+        if (chunked)
+            end = start + p->opts->max_request_size - 1;
         if (p->content_size > 0)
             end = MPMIN(end, p->content_size - 1);
+        if (capped)
+            end = MPMIN(end, p->request_end - 1);
         snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64, start, end);
         curl_easy_setopt(p->curl, CURLOPT_RANGE, range);
     } else if (ranged) {
@@ -599,6 +641,20 @@ static void start_request(struct priv *p)
     curl_multi_add_handle(p->ctx->multi, p->curl);
 }
 
+static void log_curl_error(struct priv *p, const char *what, CURLcode code)
+{
+    MP_ERR(p, "%s: %s\n", what, curl_easy_strerror(code));
+    if (code == CURLE_PEER_FAILED_VERIFICATION ||
+        code == CURLE_SSL_CACERT_BADFILE)
+    {
+        MP_ERR(p,
+            "TLS certificate verification failed.\n"
+            "This usually means an outdated CA bundle, a self-signed "
+            "certificate,\nor a MITM proxy on your network. To bypass at "
+            "your own risk, pass\n--tls-verify=no.\n");
+    }
+}
+
 static void on_done(struct priv *p, CURLcode code)
 {
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
@@ -606,7 +662,7 @@ static void on_done(struct priv *p, CURLcode code)
     if (!p->probed) {
         // Connection died before any headers arrived.
         if (code != CURLE_OK && !aborted)
-            MP_ERR(p, "error: %s\n", curl_easy_strerror(code));
+            log_curl_error(p, "error", code);
         mp_mutex_lock(&p->mtx);
         p->probed = true;
         mp_cond_broadcast(&p->cond);
@@ -623,7 +679,9 @@ static void on_done(struct priv *p, CURLcode code)
         p->retry_count = 0;
 
         bool chunked = p->seekable && p->opts->max_request_size > 0;
-        if (chunked && (p->content_size <= 0 || p->request_start < p->content_size)) {
+        bool past_size = p->content_size > 0 && p->request_start >= p->content_size;
+        bool past_end = p->request_end > 0 && p->request_start >= p->request_end;
+        if (chunked && !past_size && !past_end) {
             start_request(p);
             return;
         }
@@ -650,7 +708,7 @@ static void on_done(struct priv *p, CURLcode code)
     }
 
     if (!aborted)
-        MP_ERR(p, "transfer failed: %s\n", curl_easy_strerror(code));
+        log_curl_error(p, "transfer failed", code);
 
     mp_mutex_lock(&p->mtx);
     p->stream_error = true;
@@ -683,6 +741,8 @@ static struct curl_slist *build_header_list(struct priv *p)
         for (int i = 0; p->net_opts->http_header_fields[i]; i++)
             list = curl_slist_append(list, p->net_opts->http_header_fields[i]);
     }
+    if (p->scheme->proto == MP_CURL_PROTO_HTTP)
+        list = curl_slist_append(list, "Icy-MetaData: 1");
     return list;
 }
 
@@ -722,6 +782,7 @@ static void setup_curl(struct priv *p)
     if (p->net_opts->http_proxy && p->net_opts->http_proxy[0])
         curl_easy_setopt(c, CURLOPT_PROXY, p->net_opts->http_proxy);
 
+    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, p->net_opts->tls_verify ? 1L : 0L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, p->net_opts->tls_verify ? 2L : 0L);
     if (p->net_opts->tls_ca_file) {
@@ -814,6 +875,23 @@ static int64_t curl_get_size(struct stream *s)
     return p->content_size;
 }
 
+static int curl_control(struct stream *s, int cmd, void *arg)
+{
+    struct priv *p = s->priv;
+    switch (cmd) {
+    case STREAM_CTRL_GET_METADATA: {
+        mp_mutex_lock(&p->mtx);
+        struct mp_tags *tags = mp_icy_get_metadata(p->icy, s);
+        mp_mutex_unlock(&p->mtx);
+        if (!tags)
+            break;
+        *(struct mp_tags **)arg = tags;
+        return STREAM_OK;
+    }
+    }
+    return STREAM_UNSUPPORTED;
+}
+
 static void priv_destructor(void *ptr)
 {
     struct priv *p = ptr;
@@ -871,6 +949,15 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     p->content_size = -1;
     p->buffer_size = p->opts->buffer_size;
     p->buffer = talloc_size(p, p->buffer_size);
+    p->icy = mp_icy_new(p);
+
+    if (args->special_arg) {
+        const struct curl_open_args *oa = args->special_arg;
+        if (oa->offset > 0)
+            p->request_start = oa->offset;
+        if (oa->end_offset > 0)
+            p->request_end = oa->end_offset;
+    }
 
     mp_mutex_init(&p->mtx);
     mp_cond_init(&p->cond);
@@ -897,8 +984,13 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
 
     char *content_type = NULL;
     curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &content_type);
-    if (content_type && content_type[0])
-        s->mime_type = talloc_strdup(s, content_type);
+    bstr mime = bstr_strip(bstr_split(bstr0(content_type), ";", NULL));
+    if (mime.len)
+        s->mime_type = bstrto0(s, mime);
+
+    const char *effective_url = NULL;
+    curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+    p->effective_url = effective_url ? effective_url : p->url;
 
     s->seekable = p->seekable;
     s->is_network = true;
@@ -907,7 +999,9 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     s->fill_buffer = curl_fill_buffer;
     s->seek = p->seekable ? curl_seek : NULL;
     s->get_size = curl_get_size;
+    s->control = curl_control;
     s->close = curl_close;
+    s->pos = p->request_start;
 
     return STREAM_OK;
 }
@@ -944,8 +1038,36 @@ const stream_info_t stream_info_curl = {
 // should route all traffic through our implementation.
 
 struct curl_avio_cookie {
+    const AVClass *av_class;
     struct stream *stream;
     struct mp_cancel *cancel;
+    const char *location; // final URL after redirects, exposed via the "location" opt
+    AVIOContext *transport;
+};
+
+static const AVClass curl_avio_cookie_class = {
+    .class_name = "mpv_curl_avio",
+    .item_name  = av_default_item_name,
+    .option     = (const AVOption[]) {
+        {"location", "The actual location of the data received",
+         offsetof(struct curl_avio_cookie, location),
+         AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM},
+        {0}
+    },
+    .version = LIBAVUTIL_VERSION_INT,
+};
+
+static void *curl_avio_child_next(void *obj, void *prev)
+{
+    AVIOContext *pb = obj;
+    return prev ? NULL : pb->opaque; // the cookie
+}
+
+static const AVClass curl_avio_class = {
+    .class_name = "mpv_curl_avio",
+    .item_name  = av_default_item_name,
+    .child_next = curl_avio_child_next,
+    .version    = LIBAVUTIL_VERSION_INT,
 };
 
 static bool is_protocol_allowed(struct mp_log *log, bstr scheme,
@@ -996,10 +1118,10 @@ static int64_t curl_avio_seek(void *opaque, int64_t pos, int whence)
     return pos;
 }
 
-int mp_curl_avio_open(struct demuxer *demuxer, AVIOContext **pb_out,
-                      void **cookie_out, const char *url, int flags,
-                      AVDictionary **options,
-                      const char *whitelist, const char *blacklist)
+static int open_curl_transport(struct demuxer *demuxer, AVIOContext **pb_out,
+                               void **cookie_out, const char *url, int flags,
+                               AVDictionary **options,
+                               const char *whitelist, const char *blacklist)
 {
     *pb_out = NULL;
     *cookie_out = NULL;
@@ -1021,14 +1143,16 @@ int mp_curl_avio_open(struct demuxer *demuxer, AVIOContext **pb_out,
     // The context is required to be initialized in global.
     mp_require(demuxer->global && demuxer->global->curl);
 
-    // Nested IO plumbs whitelist/blacklist through the AVDictionary, use that
-    // if set, same as FFmpeg's implementation.
+    struct curl_open_args oa = {0};
     if (options && *options) {
         AVDictionaryEntry *e;
-        if ((e = av_dict_get(*options, "protocol_whitelist", NULL, 0)))
-            whitelist = e->value;
-        if ((e = av_dict_get(*options, "protocol_blacklist", NULL, 0)))
-            blacklist = e->value;
+        // lavf's http demuxer exposes initial/final byte offsets as AVOptions
+        // Some demuxers, like lavf/hls.c assume it is always available, even for
+        // custom IO... Add support for this.
+        if ((e = av_dict_get(*options, "offset", NULL, 0)))
+            oa.offset = strtoll(e->value, NULL, 10);
+        if ((e = av_dict_get(*options, "end_offset", NULL, 0)))
+            oa.end_offset = strtoll(e->value, NULL, 10);
     }
 
     if (!is_protocol_allowed(demuxer->log, cs->scheme, whitelist, blacklist))
@@ -1046,6 +1170,7 @@ int mp_curl_avio_open(struct demuxer *demuxer, AVIOContext **pb_out,
         .url = url,
         .flags = STREAM_READ | (demuxer->stream_origin & STREAM_ORIGIN_MASK),
         .sinfo = &stream_info_curl,
+        .special_arg = &oa,
     };
 
     struct stream *s = NULL;
@@ -1056,8 +1181,10 @@ int mp_curl_avio_open(struct demuxer *demuxer, AVIOContext **pb_out,
     }
 
     struct curl_avio_cookie *c = talloc_zero(NULL, struct curl_avio_cookie);
+    c->av_class = &curl_avio_cookie_class;
     c->stream = s;
     c->cancel = cancel;
+    c->location = ((struct priv *)s->priv)->effective_url;
 
     void *buffer = av_malloc(64 * 1024);
     if (!buffer) {
@@ -1078,22 +1205,120 @@ int mp_curl_avio_open(struct demuxer *demuxer, AVIOContext **pb_out,
         return AVERROR(ENOMEM);
     }
     pb->seekable = s->seekable ? AVIO_SEEKABLE_NORMAL : 0;
+    pb->av_class = &curl_avio_class;
+    pb->pos = oa.offset;
 
     *pb_out = pb;
     *cookie_out = c;
     return 0;
 }
 
+static void close_curl_transport(AVIOContext *pb, struct curl_avio_cookie *c)
+{
+    av_freep(&pb->buffer);
+    avio_context_free(&pb);
+    free_stream(c->stream);
+    talloc_free(c->cancel);
+    talloc_free(c);
+}
+
+// Open a `crypto+...` URL by opening the inner URL with curl and layering
+// AES-128-CBC decryption on top using the `key`/`iv` hex strings from the
+// AVDictionary. Returns AVERROR(ENOSYS) when curl can't handle the inner or
+//the AES options are missing.
+static int open_curl_crypto(struct demuxer *demuxer, AVIOContext **pb_out,
+                            void **cookie_out, const char *inner_url,
+                            int flags, AVDictionary **options,
+                            const char *whitelist, const char *blacklist)
+{
+    if (flags & AVIO_FLAG_WRITE)
+        return AVERROR(ENOSYS);
+    if (!options || !*options)
+        return AVERROR(ENOSYS);
+
+    AVDictionaryEntry *key_e = av_dict_get(*options, "key", NULL, 0);
+    AVDictionaryEntry *iv_e = av_dict_get(*options, "iv", NULL, 0);
+    if (!key_e || !iv_e)
+        return AVERROR(ENOSYS);
+
+    void *tmp = talloc_new(NULL);
+    AVIOContext *transport = NULL;
+    void *cookie = NULL;
+    AVIOContext *wrapper = NULL;
+
+    bstr key = {0}, iv = {0};
+    bstr_decode_hex(tmp, bstr0(key_e->value), &key);
+    bstr_decode_hex(tmp, bstr0(iv_e->value), &iv);
+
+    int r = open_curl_transport(demuxer, &transport, &cookie, inner_url, flags,
+                                options, whitelist, blacklist);
+    if (r < 0)
+        goto done;
+
+    r = mp_avio_crypto_open(&wrapper, transport, key, iv);
+    if (r < 0) {
+        MP_ERR(demuxer, "Failed to set up crypto stream: %s\n", av_err2str(r));
+        close_curl_transport(transport, cookie);
+        goto done;
+    }
+
+    // Consume from the dict so demuxer-side mp_avdict_print_unset stays quiet.
+    av_dict_set(options, "key", NULL, 0);
+    av_dict_set(options, "iv", NULL, 0);
+
+    ((struct curl_avio_cookie *)cookie)->transport = transport;
+    *pb_out = wrapper;
+    *cookie_out = cookie;
+
+done:
+    talloc_free(tmp);
+    return r;
+}
+
+int mp_curl_avio_open(struct demuxer *demuxer, AVIOContext **pb_out,
+                      void **cookie_out, const char *url, int flags,
+                      AVDictionary **options,
+                      const char *whitelist, const char *blacklist)
+{
+    *pb_out = NULL;
+    *cookie_out = NULL;
+
+    if (flags & AVIO_FLAG_WRITE)
+        return AVERROR(ENOSYS);
+
+    // Nested IO plumbs whitelist/blacklist through the AVDictionary, use that
+    // if set, same as FFmpeg's implementation.
+    if (options && *options) {
+        AVDictionaryEntry *e;
+        if ((e = av_dict_get(*options, "protocol_whitelist", NULL, 0)))
+            whitelist = e->value;
+        if ((e = av_dict_get(*options, "protocol_blacklist", NULL, 0)))
+            blacklist = e->value;
+    }
+
+    bstr rest = bstr0(url);
+    if (bstr_eatstart0(&rest, "crypto+") || bstr_eatstart0(&rest, "crypto:")) {
+        if (!is_protocol_allowed(demuxer->log, (bstr)bstr0_lit("crypto"), whitelist, blacklist))
+            return AVERROR(EINVAL);
+        return open_curl_crypto(demuxer, pb_out, cookie_out, rest.start,
+                                flags, options, whitelist, blacklist);
+    }
+
+    return open_curl_transport(demuxer, pb_out, cookie_out, url, flags,
+                               options, whitelist, blacklist);
+}
+
 void mp_curl_avio_close(AVIOContext *pb, void *cookie)
 {
     struct curl_avio_cookie *c = cookie;
-    if (pb) {
-        av_freep(&pb->buffer);
-        avio_context_free(&pb);
+    if (!c)
+        return;
+
+    AVIOContext *transport = c->transport;
+    if (transport) {
+        mp_avio_crypto_close(&pb);
+    } else {
+        transport = pb;
     }
-    if (c) {
-        free_stream(c->stream);
-        talloc_free(c->cancel);
-        talloc_free(c);
-    }
+    close_curl_transport(transport, c);
 }

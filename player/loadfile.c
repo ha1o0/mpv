@@ -524,7 +524,7 @@ static bool compare_track(struct track *t1, struct track *t2, char **langs, bool
     bool sub = t2->type == STREAM_SUB;
     bool ext1 = t1->is_external && !t1->no_default;
     bool ext2 = t2->is_external && !t2->no_default;
-    if (ext1 != ext2) {
+    if (ext1 != ext2 && t1->image == t2->image) {
         if (t1->attached_picture && t2->attached_picture
             && opts->audio_display == 1)
             return !ext1;
@@ -988,7 +988,7 @@ int mp_add_external_file(struct MPContext *mpctx, char *filename,
         } else {
             bstr parent = {0};
             if (mpctx->filename)
-                parent = bstr_strip_ext(bstr0(mp_basename(mpctx->filename)));
+                parent = mp_strip_ext(bstr0(mp_basename(mpctx->filename)));
             bstr title = bstr0(mp_basename(disp_filename));
             bstr_eatstart(&title, parent);
             bstr_eatstart(&title, bstr0("."));

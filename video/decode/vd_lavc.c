@@ -166,7 +166,7 @@ const struct m_sub_options hwdec_conf = {
     .defaults = &(const struct hwdec_opts){
         .software_fallback = 3,
         .hwdec_api = (char *[]){"no", NULL,},
-        .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx",
+        .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx,apv",
         // Maximum number of surfaces the player wants to buffer. This number
         // might require adjustment depending on whatever the player does;
         // for example, if vo_gpu increases the number of reference surfaces for
@@ -589,6 +589,14 @@ static void select_and_set_hwdec(struct mp_filter *vd)
 
                     const struct hwcontext_fns *fns =
                                 hwdec_get_hwcontext_fns(hwdec->lavc_device);
+                    if (fns && fns->is_codec_allowed &&
+                        !fns->is_codec_allowed(ctx->hwdec_dev, hwdec->codec->id))
+                    {
+                        MP_WARN(vd, "Hardware decoding of '%s' is disabled on this "
+                                    "device.\n", codec);
+                        av_buffer_unref(&ctx->hwdec_dev);
+                        continue;
+                    }
                     if (fns && fns->is_emulated && fns->is_emulated(ctx->hwdec_dev)) {
                         if (hwdec_auto) {
                             MP_VERBOSE(vd, "Not using emulated API.\n");
