@@ -49,6 +49,7 @@ extern "C" {
  * Supported backends
  * ------------------
  *
+ * Direct3D 11: via MPV_RENDER_API_TYPE_D3D11, see render_d3d11.h header.
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
@@ -432,6 +433,17 @@ typedef enum mpv_render_param_type {
      *   "gpu-next"
      */
     MPV_RENDER_PARAM_BACKEND = 21,
+    /**
+     * Required parameters for initializing the Direct3D 11 renderer. Valid
+     * for mpv_render_context_create().
+     * Type: mpv_d3d11_init_params*
+     */
+    MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 22,
+    /**
+     * Describes a D3D11 render target. Valid for mpv_render_context_render().
+     * Type: mpv_d3d11_fbo*
+     */
+    MPV_RENDER_PARAM_D3D11_FBO = 23,
 } mpv_render_param_type;
 
 /**
@@ -474,6 +486,8 @@ typedef struct mpv_render_param {
 /**
  * Predefined values for MPV_RENDER_PARAM_API_TYPE.
  */
+// See render_d3d11.h
+#define MPV_RENDER_API_TYPE_D3D11 "d3d11"
 // See render_gl.h
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
 // See section "Software renderer"
