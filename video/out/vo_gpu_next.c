@@ -27,6 +27,7 @@
 #include <libplacebo/shaders/icc.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
+#include <libavutil/dovi_meta.h>
 
 #include "config.h"
 #include "common/common.h"
@@ -718,6 +719,48 @@ static bool use_ref_luma(const struct pl_color_space *csp, const struct pl_color
     return false;
 }
 
+static void *get_side_data(const struct mp_image *mpi,
+                           enum AVFrameSideDataType type)
+{
+    for (int i = 0; i < mpi->num_ff_side_data; i++) {
+        struct mp_ff_side_data *sd = &mpi->ff_side_data[i];
+        if (sd->type == type && sd->buf)
+            return (void *)sd->buf->data;
+    }
+    return NULL;
+}
+
+static bool dovi_requires_base_layer_fallback(struct mp_image *mpi)
+{
+#ifdef PL_HAVE_LAV_DOLBY_VISION
+    for (int n = 0; n < mpi->num_ff_side_data; n++) {
+        struct mp_ff_side_data *sd = &mpi->ff_side_data[n];
+        if (sd->type != AV_FRAME_DATA_DOVI_METADATA || !sd->buf || !sd->buf->data)
+            continue;
+
+        const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
+        const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+        return header && !header->disable_residual_flag;
+    }
+#endif
+
+    return false;
+}
+
+static void restore_dovi_base_layer_params(struct mp_image *mpi,
+                                           struct mp_image_params *par)
+{
+    mp_image_params_restore_dovi_mapping(par);
+    par->repr.dovi = NULL;
+
+    par->color.hdr = (struct pl_hdr_metadata){0};
+    pl_map_hdr_metadata(&par->color.hdr, &(struct pl_av_hdr_metadata) {
+        .mdm = get_side_data(mpi, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA),
+        .clm = get_side_data(mpi, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL),
+        .dhp = get_side_data(mpi, AV_FRAME_DATA_DYNAMIC_HDR_PLUS),
+    });
+}
+
 static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                       struct pl_frame *frame)
 {
@@ -740,6 +783,11 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
 
         par = p->hwdec_mapper->dst_params;
     }
+
+    // mpv does not decode DV residual/enhancement layers, so render the base
+    // layer and ignore DV RPU-derived dynamic metadata for these frames.
+    if (dovi_requires_base_layer_fallback(mpi))
+        restore_dovi_base_layer_params(mpi, &par);
 
     mp_image_params_guess_csp(&par);
 

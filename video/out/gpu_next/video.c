@@ -13,6 +13,7 @@
 #include "libplacebo/filters.h"            // for pl_filter_nearest
 #include "libplacebo/gpu.h"                // for pl_tex_params, pl_tex_t
 #include "libplacebo/renderer.h"           // for pl_frame_mix, pl_frame
+#include "libplacebo/utils/libav.h"        // for pl_av_hdr_metadata
 #include "sub/draw_bmp.h"                  // for mp_draw_sub_formats
 #include "sub/osd.h"                       // for sub_bitmap, sub_bitmaps
 #include "ta/ta_talloc.h"                  // for talloc_free, talloc_zero
@@ -104,13 +105,20 @@ struct frame_priv {
     struct ra_hwdec *hwdec;
 };
 
-static bool dovi_mapping_requires_residual_layer(struct mp_image *mpi,
-                                                 const struct mp_image_params *par)
+static void *get_side_data(const struct mp_image *mpi,
+                           enum AVFrameSideDataType type)
+{
+    for (int i = 0; i < mpi->num_ff_side_data; i++) {
+        struct mp_ff_side_data *sd = &mpi->ff_side_data[i];
+        if (sd->type == type && sd->buf)
+            return (void *)sd->buf->data;
+    }
+    return NULL;
+}
+
+static bool dovi_requires_base_layer_fallback(struct mp_image *mpi)
 {
 #ifdef PL_HAVE_LAV_DOLBY_VISION
-    if (par->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
-        return false;
-
     for (int n = 0; n < mpi->num_ff_side_data; n++) {
         struct mp_ff_side_data *sd = &mpi->ff_side_data[n];
         if (sd->type != AV_FRAME_DATA_DOVI_METADATA || !sd->buf || !sd->buf->data)
@@ -123,6 +131,20 @@ static bool dovi_mapping_requires_residual_layer(struct mp_image *mpi,
 #endif
 
     return false;
+}
+
+static void restore_dovi_base_layer_params(struct mp_image *mpi,
+                                           struct mp_image_params *par)
+{
+    mp_image_params_restore_dovi_mapping(par);
+    par->repr.dovi = NULL;
+
+    par->color.hdr = (struct pl_hdr_metadata){0};
+    pl_map_hdr_metadata(&par->color.hdr, &(struct pl_av_hdr_metadata) {
+        .mdm = get_side_data(mpi, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA),
+        .clm = get_side_data(mpi, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL),
+        .dhp = get_side_data(mpi, AV_FRAME_DATA_DYNAMIC_HDR_PLUS),
+    });
 }
 
 static bool describe_frame_planes(struct pl_frame *frame, int imgfmt)
@@ -270,9 +292,10 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         par = p->hwdec_mapper->dst_params;
     }
 
-    // mpv does not decode DV residual/enhancement layers, so render the base layer.
-    if (dovi_mapping_requires_residual_layer(mpi, &par))
-        mp_image_params_restore_dovi_mapping(&par);
+    // mpv does not decode DV residual/enhancement layers, so render the base
+    // layer and ignore DV RPU-derived dynamic metadata for these frames.
+    if (dovi_requires_base_layer_fallback(mpi))
+        restore_dovi_base_layer_params(mpi, &par);
 
     mp_image_params_guess_csp(&par);
 
