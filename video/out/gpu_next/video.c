@@ -23,6 +23,9 @@
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
 #include "video/out/vo.h"                  // for vo_frame
 
+#include <libavutil/dovi_meta.h>
+#include <libavutil/frame.h>
+
 #include "config.h"
 #if HAVE_D3D11
 #include "osdep/windows_utils.h"
@@ -100,6 +103,27 @@ struct frame_priv {
     struct pl_video *p; // A pointer back to the main pl_video engine struct.
     struct ra_hwdec *hwdec;
 };
+
+static bool dovi_mapping_requires_residual_layer(struct mp_image *mpi,
+                                                 const struct mp_image_params *par)
+{
+#ifdef PL_HAVE_LAV_DOLBY_VISION
+    if (par->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
+        return false;
+
+    for (int n = 0; n < mpi->num_ff_side_data; n++) {
+        struct mp_ff_side_data *sd = &mpi->ff_side_data[n];
+        if (sd->type != AV_FRAME_DATA_DOVI_METADATA || !sd->buf || !sd->buf->data)
+            continue;
+
+        const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
+        const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+        return header && !header->disable_residual_flag;
+    }
+#endif
+
+    return false;
+}
 
 static bool describe_frame_planes(struct pl_frame *frame, int imgfmt)
 {
@@ -245,6 +269,10 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         }
         par = p->hwdec_mapper->dst_params;
     }
+
+    // mpv does not decode DV residual/enhancement layers, so render the base layer.
+    if (dovi_mapping_requires_residual_layer(mpi, &par))
+        mp_image_params_restore_dovi_mapping(&par);
 
     mp_image_params_guess_csp(&par);
 
@@ -579,11 +607,11 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // frame's duration is equivalent to one source frame (1.0 in normalized time).
     mix.vsync_duration = 1.0f;
 
-    // Prepare the rendering parameters for libplacebo
-    struct pl_render_params params = {
+    // Prepare the rendering parameters for libplacebo.
+    struct pl_render_params params = *pl_render_params(
         .upscaler = &pl_filter_nearest,
         .downscaler = &pl_filter_nearest,
-    };
+    );
 
     // Declare a local struct to hold the color adjustment values.
     struct pl_color_adjustment color_adj;
@@ -677,10 +705,10 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
     update_overlays(p, osd_res, 0, PL_OVERLAY_COORDS_DST_FRAME,
                     &p->osd_state_storage, &target_frame, frame->current);
 
-    const struct pl_render_params params = {
+    const struct pl_render_params params = *pl_render_params(
         .upscaler = &pl_filter_nearest,
         .downscaler = &pl_filter_nearest,
-    };
+    );
 
     if (!ra_next_render_image(p->ra, &source_frame, &target_frame, &params)) {
         mp_msg(p->log, MSGL_ERR, "pl_video_screenshot: rendering failed\n");
