@@ -9,6 +9,8 @@ struct mp_log;
 struct mp_osd_res;
 struct mp_rect;
 struct mpv_global;
+struct mp_hwdec_devices;
+struct ra_ctx;
 struct osd_state;
 struct ra_next;
 struct vo_frame;
@@ -16,7 +18,9 @@ struct vo_frame;
 /**
  * Initializes the rendering engine.
  */
-struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, struct ra_next *ra);
+struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log,
+                               struct ra_next *ra, struct ra_ctx *ra_ctx,
+                               struct mp_hwdec_devices *hwdec_devs);
 
 /**
  * Shuts down and destroys the rendering engine.

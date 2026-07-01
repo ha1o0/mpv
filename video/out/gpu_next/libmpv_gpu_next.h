@@ -3,6 +3,8 @@
 #include <libplacebo/gpu.h>  // for pl_gpu, pl_tex
 #include "mpv/render.h"      // for mpv_render_param
 
+struct ra_ctx;
+
 /**
  * This struct represents an instance of a specific API context implementation.
  * It's created by the Host (`libmpv_gpu_next.c`) and passed to the concrete
@@ -13,6 +15,7 @@ struct libmpv_gpu_next_context {
     // Inputs from the Host
     struct mpv_global *global;
     struct mp_log *log;
+    struct ra_ctx *ra_ctx;
     void *priv; // Private state for the implementation's use
 
     const struct libmpv_gpu_next_context_fns *fns;
@@ -78,3 +81,4 @@ struct libmpv_gpu_next_context_fns {
  * to its list of available backends.
  */
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_gl;
+extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;

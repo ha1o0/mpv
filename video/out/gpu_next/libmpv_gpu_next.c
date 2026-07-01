@@ -1,8 +1,8 @@
 #include "libmpv_gpu_next.h"
 #include <stddef.h>             // for NULL
 #include "common/msg.h"         // for mp_log_new, MP_ERR
-#include "config.h"             // for HAVE_GL
-#include "libplacebo/config.h"  // for PL_HAVE_OPENGL
+#include "config.h"             // for HAVE_D3D11, HAVE_GL
+#include "libplacebo/config.h"  // for PL_HAVE_D3D11, PL_HAVE_OPENGL
 #include "libplacebo/gpu.h"     // for pl_tex, pl_tex_params, pl_tex_t
 #include "mpv/client.h"         // for mpv_error
 #include "mpv/render.h"         // for mpv_render_param, mpv_render_param_type
@@ -31,9 +31,12 @@ struct priv {
 };
 
 /*
-* List of available API context implementations (e.g., GL, Vulkan - currently only OpenGL)
+* List of available API context implementations.
 */
 static const struct libmpv_gpu_next_context_fns *context_backends[] = {
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    &libmpv_gpu_next_context_d3d11,
+#endif
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     &libmpv_gpu_next_context_gl,
 #endif
@@ -83,16 +86,21 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
         return err;
     }
 
+    // Create hardware decoder devices before initializing the renderer, so the
+    // renderer can register GPU interop devices such as d3d11va.
+    ctx->hwdec_devs = hwdec_devices_create();
+
     // Initialize our synchronous libplacebo rendering engine.
-    p->video_engine = pl_video_init(ctx->global, ctx->log, p->context->ra);
+    p->video_engine = pl_video_init(ctx->global, ctx->log, p->context->ra,
+                                    p->context->ra_ctx, ctx->hwdec_devs);
     if (!p->video_engine) {
+        hwdec_devices_destroy(ctx->hwdec_devs);
+        ctx->hwdec_devs = NULL;
         p->context->fns->destroy(p->context);
         talloc_free(p->context);
         return MPV_ERROR_VO_INIT_FAILED;
     }
 
-    // Create hardware decoder devices.
-    ctx->hwdec_devs = hwdec_devices_create();
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
     return 0;
 }
@@ -106,8 +114,8 @@ static void destroy(struct render_backend *ctx)
     struct priv *p = ctx->priv;
     if (!p) return;
 
-    hwdec_devices_destroy(ctx->hwdec_devs);
     pl_video_uninit(&p->video_engine);
+    hwdec_devices_destroy(ctx->hwdec_devs);
     if (p->context) {
         p->context->fns->destroy(p->context); // This destroys the RA
         talloc_free(p->context);

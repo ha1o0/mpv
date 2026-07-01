@@ -1,4 +1,8 @@
 #include "video.h"
+#include <libplacebo/config.h>             // for PL_HAVE_D3D11
+#ifdef PL_HAVE_D3D11
+#include <libplacebo/d3d11.h>
+#endif
 #include <libplacebo/utils/frame_queue.h>  // for pl_source_frame, pl_queue_...
 #include <stddef.h>                        // for NULL
 #include <stdint.h>                        // for uint64_t, uint32_t, uintptr_t
@@ -15,8 +19,15 @@
 #include "video/csputils.h"                // for mp_csp_params, mp_csp_equa...
 #include "video/img_format.h"              // for mp_imgfmt
 #include "video/mp_image.h"                // for mp_image, mp_image_params
+#include "video/out/gpu/hwdec.h"           // for ra_hwdec_mapper
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
 #include "video/out/vo.h"                  // for vo_frame
+
+#include "config.h"
+#if HAVE_D3D11
+#include "osdep/windows_utils.h"
+#include "video/out/d3d11/ra_d3d11.h"
+#endif
 
 // Forward declarations
 struct mp_log;
@@ -57,6 +68,10 @@ struct pl_video_osd_state {
 struct pl_video {
     struct mp_log *log;
     struct ra_next *ra;    // The libplacebo rendering abstraction
+    struct ra_ctx *ra_ctx;
+    struct mp_hwdec_devices *hwdec_devs;
+    struct ra_hwdec_ctx hwdec_ctx;
+    struct ra_hwdec_mapper *hwdec_mapper;
     ra_queue queue;        // The frame queue for handling video frames and interpolation.
     uint64_t last_frame_id;// To avoid pushing duplicate frames into the queue.
     double last_pts;       // Last presentation timestamp we rendered at, for redraws.
@@ -83,7 +98,125 @@ struct pl_video {
  */
 struct frame_priv {
     struct pl_video *p; // A pointer back to the main pl_video engine struct.
+    struct ra_hwdec *hwdec;
 };
+
+static bool describe_frame_planes(struct pl_frame *frame, int imgfmt)
+{
+    struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(imgfmt);
+    if (!desc.num_planes)
+        return false;
+
+    frame->num_planes = desc.num_planes;
+    for (int n = 0; n < frame->num_planes; n++) {
+        struct pl_plane *plane = &frame->planes[n];
+        int *map = plane->component_mapping;
+        for (int c = 0; c < mp_imgfmt_desc_get_num_comps(&desc); c++) {
+            if (desc.comps[c].plane != n)
+                continue;
+
+            uint8_t offset = desc.comps[c].offset;
+            int index = plane->components++;
+            while (index > 0 && desc.comps[map[index - 1]].offset > offset) {
+                map[index] = map[index - 1];
+                index--;
+            }
+            map[index] = c;
+        }
+    }
+
+    return true;
+}
+
+static bool hwdec_reconfig(struct pl_video *p, struct ra_hwdec *hwdec,
+                           const struct mp_image_params *par)
+{
+    if (p->hwdec_mapper) {
+        if (mp_image_params_static_equal(par, &p->hwdec_mapper->src_params)) {
+            p->hwdec_mapper->src_params.repr.dovi = par->repr.dovi;
+            p->hwdec_mapper->dst_params.repr.dovi = par->repr.dovi;
+            p->hwdec_mapper->src_params.color.hdr = par->color.hdr;
+            p->hwdec_mapper->dst_params.color.hdr = par->color.hdr;
+            return true;
+        }
+
+        ra_hwdec_mapper_free(&p->hwdec_mapper);
+    }
+
+    p->hwdec_mapper = ra_hwdec_mapper_create(hwdec, par);
+    if (!p->hwdec_mapper) {
+        mp_msg(p->log, MSGL_ERR, "Initializing texture for hardware decoding failed.\n");
+        return false;
+    }
+
+    return true;
+}
+
+static pl_tex hwdec_get_tex(struct pl_video *p, int n)
+{
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (p->ra_ctx && p->ra_ctx->ra && ra_is_d3d11(p->ra_ctx->ra)) {
+        struct ra_tex *ratex = p->hwdec_mapper->tex[n];
+        int array_slice = 0;
+        ID3D11Resource *res =
+            ra_d3d11_get_raw_tex(p->ra_ctx->ra, ratex, &array_slice);
+        if (!res)
+            return NULL;
+
+        pl_tex tex = pl_d3d11_wrap(p->ra->gpu, pl_d3d11_wrap_params(
+            .tex = res,
+            .array_slice = array_slice,
+            .fmt = ra_d3d11_get_format(ratex->params.format),
+            .w = ratex->params.w,
+            .h = ratex->params.h,
+        ));
+        SAFE_RELEASE(res);
+        return tex;
+    }
+#endif
+
+    mp_msg(p->log, MSGL_ERR, "Unsupported gpu-next libmpv hwdec mapping.\n");
+    return NULL;
+}
+
+static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct frame_priv *fp = mpi->priv;
+    struct pl_video *p = fp->p;
+
+    if (!hwdec_reconfig(p, fp->hwdec, &mpi->params))
+        return false;
+
+    if (ra_hwdec_mapper_map(p->hwdec_mapper, mpi) < 0) {
+        mp_msg(p->log, MSGL_ERR, "Mapping hardware decoded surface failed.\n");
+        return false;
+    }
+
+    for (int n = 0; n < frame->num_planes; n++) {
+        frame->planes[n].texture = hwdec_get_tex(p, n);
+        if (!frame->planes[n].texture) {
+            for (int i = 0; i < n; i++)
+                ra_next_tex_destroy(p->ra, &frame->planes[i].texture);
+            ra_hwdec_mapper_unmap(p->hwdec_mapper);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct frame_priv *fp = mpi->priv;
+    struct pl_video *p = fp->p;
+
+    for (int n = 0; n < frame->num_planes; n++)
+        ra_next_tex_destroy(p->ra, &frame->planes[n].texture);
+
+    ra_hwdec_mapper_unmap(p->hwdec_mapper);
+}
 
 /**
  * @brief Callback to map an mp_image to a pl_frame for rendering.
@@ -102,17 +235,55 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
+    struct mp_image_params par = mpi->params;
 
-    // Use the RA helper to upload the mp_image data to a new set of textures
-    // and populate the pl_frame struct with the result.
-    if (!ra_upload_mp_image(p->ra, frame, mpi)) {
-        talloc_free(mpi); // Clean up the mp_image reference on failure
+    fp->hwdec = p->hwdec_ctx.ra_ctx ? ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt) : NULL;
+    if (fp->hwdec) {
+        if (!hwdec_reconfig(p, fp->hwdec, &mpi->params)) {
+            talloc_free(mpi);
+            return false;
+        }
+        par = p->hwdec_mapper->dst_params;
+    }
+
+    mp_image_params_guess_csp(&par);
+
+    *frame = (struct pl_frame) {
+        .color = par.color,
+        .repr = par.repr,
+        .profile = {
+            .data = mpi->icc_profile ? mpi->icc_profile->data : NULL,
+            .len = mpi->icc_profile ? mpi->icc_profile->size : 0,
+        },
+        .rotation = par.rotate / 90,
+        .crop = {
+            .x0 = 0, .y0 = 0,
+            .x1 = mpi->w, .y1 = mpi->h,
+        },
+        .user_data = mpi,
+    };
+
+    if (fp->hwdec) {
+        frame->acquire = hwdec_acquire;
+        frame->release = hwdec_release;
+        if (!describe_frame_planes(frame, par.imgfmt)) {
+            talloc_free(mpi);
+            return false;
+        }
+    } else if (!ra_upload_mp_image(p->ra, frame, mpi)) {
+        talloc_free(mpi);
         return false;
     }
 
-    // Store a pointer back to the original mp_image. This is used to get a unique
-    // signature for the frame and to access metadata (like colorspace) later.
+    frame->profile = (struct pl_icc_profile) {
+        .data = mpi->icc_profile ? mpi->icc_profile->data : NULL,
+        .len = mpi->icc_profile ? mpi->icc_profile->size : 0,
+    };
+    frame->rotation = par.rotate / 90;
     frame->user_data = mpi;
+
+    pl_frame_set_chroma_location(frame, par.chroma_location);
+    pl_icc_profile_compute_signature(&frame->profile);
     return true;
 }
 
@@ -132,9 +303,9 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
 
-    // Use the RA helper to destroy the GPU textures associated with the frame.
-    ra_cleanup_pl_frame(p->ra, frame);
-    // Free the mp_image reference itself.
+    if (!fp->hwdec)
+        ra_cleanup_pl_frame(p->ra, frame);
+
     talloc_free(mpi);
 }
 
@@ -159,10 +330,14 @@ static void discard_frame(const struct pl_source_frame *src)
  * @param ra The rendering abstraction context.
  * @return A pointer to the newly created pl_video engine, or NULL on failure.
  */
-struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, struct ra_next *ra) {
+struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log,
+                               struct ra_next *ra, struct ra_ctx *ra_ctx,
+                               struct mp_hwdec_devices *hwdec_devs) {
     struct pl_video *p = talloc_zero(NULL, struct pl_video);
     p->log = log;
     p->ra = ra;
+    p->ra_ctx = ra_ctx;
+    p->hwdec_devs = hwdec_devs;
     p->queue = ra_next_queue_create(ra);
 
     // Pre-find the texture formats we'll need for OSD bitmaps for efficiency.
@@ -171,6 +346,15 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
 
     // Create the state object that tracks brightness, contrast, etc.
     p->video_eq = mp_csp_equalizer_create(p, global);
+
+    if (p->ra_ctx && p->hwdec_devs) {
+        p->hwdec_ctx = (struct ra_hwdec_ctx) {
+            .log = p->log,
+            .global = global,
+            .ra_ctx = p->ra_ctx,
+        };
+        ra_hwdec_ctx_init(&p->hwdec_ctx, p->hwdec_devs, NULL, true);
+    }
 
     return p;
 }
@@ -182,6 +366,9 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
 void pl_video_uninit(struct pl_video **p_ptr) {
     struct pl_video *p = *p_ptr;
     if (!p) return;
+
+    if (p->ra && p->ra->gpu)
+        pl_gpu_finish(p->ra->gpu);
 
     ra_next_queue_destroy(&p->queue);
 
@@ -195,6 +382,10 @@ void pl_video_uninit(struct pl_video **p_ptr) {
         ra_next_tex_destroy(p->ra, &p->sub_tex[i]);
     }
     talloc_free(p->sub_tex);
+
+    ra_hwdec_mapper_free(&p->hwdec_mapper);
+    if (p->hwdec_ctx.ra_ctx)
+        ra_hwdec_ctx_uninit(&p->hwdec_ctx);
 
     talloc_free(p);
     *p_ptr = NULL;
