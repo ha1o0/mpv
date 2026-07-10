@@ -1,9 +1,11 @@
 #include "video.h"
+#include <libavutil/attributes.h>          // for AV_NOWARN_DEPRECATED
 #include <libplacebo/config.h>             // for PL_HAVE_D3D11
 #ifdef PL_HAVE_D3D11
 #include <libplacebo/d3d11.h>
 #endif
 #include <libplacebo/utils/frame_queue.h>  // for pl_source_frame, pl_queue_...
+#include <math.h>                          // for isnan
 #include <stddef.h>                        // for NULL
 #include <stdint.h>                        // for uint64_t, uint32_t, uintptr_t
 #include "assert.h"                        // for assert
@@ -13,7 +15,9 @@
 #include "libplacebo/filters.h"            // for pl_filter_nearest
 #include "libplacebo/gpu.h"                // for pl_tex_params, pl_tex_t
 #include "libplacebo/renderer.h"           // for pl_frame_mix, pl_frame
+#include "libplacebo/shaders/colorspace.h" // for tone/gamut mapping functions
 #include "libplacebo/utils/libav.h"        // for pl_av_hdr_metadata
+#include "options/m_config.h"              // for m_config_cache
 #include "sub/draw_bmp.h"                  // for mp_draw_sub_formats
 #include "sub/osd.h"                       // for sub_bitmap, sub_bitmaps
 #include "ta/ta_talloc.h"                  // for talloc_free, talloc_zero
@@ -21,6 +25,7 @@
 #include "video/img_format.h"              // for mp_imgfmt
 #include "video/mp_image.h"                // for mp_image, mp_image_params
 #include "video/out/gpu/hwdec.h"           // for ra_hwdec_mapper
+#include "video/out/gpu/video.h"           // for gl_video_conf/options
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
 #include "video/out/vo.h"                  // for vo_frame
 
@@ -94,6 +99,7 @@ struct pl_video {
 
     // Color adjustment state
     struct mp_csp_equalizer_state *video_eq; // Manages brightness, contrast, hue, etc.
+    struct m_config_cache *opts_cache;       // Standard mpv gpu/tone-map options.
 };
 
 /**
@@ -375,6 +381,105 @@ static void discard_frame(const struct pl_source_frame *src)
 }
 
 /**
+ * @brief Applies mpv's standard GPU color-management options to this custom
+ *        libmpv gpu-next renderer.
+ *
+ * The regular vo_gpu_next backend translates gl_video_conf into libplacebo
+ * render parameters in update_options(). This libmpv backend used to bypass
+ * that translation completely, which meant properties such as tone-mapping,
+ * hdr-compute-peak and hdr-peak-percentile were accepted by mpv but never
+ * reached libplacebo.
+ */
+static void update_color_management(struct pl_video *p,
+                                    struct pl_frame *target,
+                                    struct pl_render_params *params,
+                                    struct pl_peak_detect_params *peak_params,
+                                    struct pl_color_map_params *color_map_params,
+                                    const struct pl_color_space *source)
+{
+    m_config_cache_update(p->opts_cache);
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+
+    // This backend renders into a Flutter-owned SDR texture. Keep sRGB as the
+    // default output target, while still honoring explicit mpv target options.
+    if (opts->target_prim)
+        target->color.primaries = opts->target_prim;
+    if (opts->target_trc)
+        target->color.transfer = opts->target_trc;
+    if (opts->target_peak)
+        target->color.hdr.max_luma = opts->target_peak;
+    if (opts->hdr_reference_white && !target->color.hdr.max_luma &&
+        !pl_color_transfer_is_hdr(target->color.transfer))
+    {
+        target->color.hdr.max_luma = opts->hdr_reference_white;
+    }
+    if (opts->target_gamut)
+        mp_parse_raw_primaries(mp_null_log, opts->target_gamut,
+                               &target->color.hdr.prim);
+
+    // Match vo_gpu_next's SDR output convention for HDR input. mpv treats an
+    // sRGB reference display as a pure 2.2 power function by default.
+    if (source && pl_color_space_is_hdr(source) &&
+        target->color.transfer == PL_COLOR_TRC_SRGB &&
+        opts->treat_srgb_as_power22 & 2)
+    {
+        target->color.transfer = PL_COLOR_TRC_GAMMA22;
+    }
+
+    *peak_params = pl_peak_detect_default_params;
+    peak_params->smoothing_period = opts->tone_map.decay_rate;
+    peak_params->scene_threshold_low = opts->tone_map.scene_threshold_low;
+    peak_params->scene_threshold_high = opts->tone_map.scene_threshold_high;
+    peak_params->percentile = opts->tone_map.peak_percentile;
+    params->peak_detect_params = opts->tone_map.compute_peak >= 0
+                               ? peak_params
+                               : NULL;
+
+    const struct pl_tone_map_function * const tone_map_funs[] = {
+        [TONE_MAPPING_AUTO]      = &pl_tone_map_auto,
+        [TONE_MAPPING_CLIP]      = &pl_tone_map_clip,
+        [TONE_MAPPING_MOBIUS]    = &pl_tone_map_mobius,
+        [TONE_MAPPING_REINHARD]  = &pl_tone_map_reinhard,
+        [TONE_MAPPING_HABLE]     = &pl_tone_map_hable,
+        [TONE_MAPPING_GAMMA]     = &pl_tone_map_gamma,
+        [TONE_MAPPING_LINEAR]    = &pl_tone_map_linear,
+        [TONE_MAPPING_SPLINE]    = &pl_tone_map_spline,
+        [TONE_MAPPING_BT_2390]   = &pl_tone_map_bt2390,
+        [TONE_MAPPING_BT_2446A]  = &pl_tone_map_bt2446a,
+        [TONE_MAPPING_ST2094_40] = &pl_tone_map_st2094_40,
+        [TONE_MAPPING_ST2094_10] = &pl_tone_map_st2094_10,
+    };
+    const struct pl_gamut_map_function * const gamut_modes[] = {
+        [GAMUT_AUTO]       = pl_color_map_default_params.gamut_mapping,
+        [GAMUT_CLIP]       = &pl_gamut_map_clip,
+        [GAMUT_PERCEPTUAL] = &pl_gamut_map_perceptual,
+        [GAMUT_RELATIVE]   = &pl_gamut_map_relative,
+        [GAMUT_SATURATION] = &pl_gamut_map_saturation,
+        [GAMUT_ABSOLUTE]   = &pl_gamut_map_absolute,
+        [GAMUT_DESATURATE] = &pl_gamut_map_desaturate,
+        [GAMUT_DARKEN]     = &pl_gamut_map_darken,
+        [GAMUT_WARN]       = &pl_gamut_map_highlight,
+        [GAMUT_LINEAR]     = &pl_gamut_map_linear,
+    };
+
+    *color_map_params = pl_color_map_default_params;
+    color_map_params->tone_mapping_function =
+        tone_map_funs[opts->tone_map.curve];
+AV_NOWARN_DEPRECATED(
+    color_map_params->tone_mapping_param = opts->tone_map.curve_param;
+    if (isnan(color_map_params->tone_mapping_param))
+        color_map_params->tone_mapping_param = 0.0f;
+)
+    color_map_params->inverse_tone_mapping = opts->tone_map.inverse;
+    color_map_params->contrast_recovery = opts->tone_map.contrast_recovery;
+    color_map_params->contrast_smoothness =
+        opts->tone_map.contrast_smoothness;
+    color_map_params->visualize_lut = opts->tone_map.visualize;
+    color_map_params->gamut_mapping = gamut_modes[opts->tone_map.gamut_mode];
+    params->color_map_params = color_map_params;
+}
+
+/**
  * @brief Initializes the synchronous libplacebo rendering engine.
  * @param global The mpv global context.
  * @param log The logging context.
@@ -397,6 +502,7 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log,
 
     // Create the state object that tracks brightness, contrast, etc.
     p->video_eq = mp_csp_equalizer_create(p, global);
+    p->opts_cache = m_config_cache_alloc(p, global, &gl_video_conf);
 
     if (p->ra_ctx && p->hwdec_devs) {
         p->hwdec_ctx = (struct ra_hwdec_ctx) {
@@ -636,8 +742,17 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
         .downscaler = &pl_filter_nearest,
     );
 
-    // Declare a local struct to hold the color adjustment values.
-    struct pl_color_adjustment color_adj;
+    struct pl_peak_detect_params peak_params;
+    struct pl_color_map_params color_map_params;
+    const struct pl_color_space *source_color = queue_mix.num_frames > 0
+                                               ? &queue_mix.frames[0]->color
+                                               : NULL;
+    update_color_management(p, &target_frame, &params, &peak_params,
+                            &color_map_params, source_color);
+
+    // Start from libplacebo's neutral defaults so every field, including color
+    // temperature, is initialized before applying mpv's equalizer values.
+    struct pl_color_adjustment color_adj = *pl_color_adjustment();
 
     // Query the current brightness/contrast/etc values from the equalizer
     struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
@@ -728,10 +843,14 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
     update_overlays(p, osd_res, 0, PL_OVERLAY_COORDS_DST_FRAME,
                     &p->osd_state_storage, &target_frame, frame->current);
 
-    const struct pl_render_params params = *pl_render_params(
+    struct pl_render_params params = *pl_render_params(
         .upscaler = &pl_filter_nearest,
         .downscaler = &pl_filter_nearest,
     );
+    struct pl_peak_detect_params peak_params;
+    struct pl_color_map_params color_map_params;
+    update_color_management(p, &target_frame, &params, &peak_params,
+                            &color_map_params, &source_frame.color);
 
     if (!ra_next_render_image(p->ra, &source_frame, &target_frame, &params)) {
         mp_msg(p->log, MSGL_ERR, "pl_video_screenshot: rendering failed\n");
