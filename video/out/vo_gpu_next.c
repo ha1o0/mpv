@@ -51,6 +51,7 @@
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
 #include "gpu_next/context.h"
+#include "gpu_next/options.h"
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 #include <libplacebo/opengl.h>
@@ -238,6 +239,12 @@ const struct m_sub_options gl_next_conf = {
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
 };
+
+int gpu_next_get_image_subs_hdr_peak(const struct m_config_cache *cache)
+{
+    const struct gl_next_opts *opts = cache->opts;
+    return opts->image_subs_hdr_peak;
+}
 
 static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
 {

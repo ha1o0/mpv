@@ -27,6 +27,7 @@
 #include "video/out/gpu/hwdec.h"           // for ra_hwdec_mapper
 #include "video/out/gpu/video.h"           // for gl_video_conf/options
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
+#include "video/out/gpu_next/options.h"    // for gpu-next image subtitle options
 #include "video/out/vo.h"                  // for vo_frame
 
 #include <libavutil/dovi_meta.h>
@@ -100,6 +101,7 @@ struct pl_video {
     // Color adjustment state
     struct mp_csp_equalizer_state *video_eq; // Manages brightness, contrast, hue, etc.
     struct m_config_cache *opts_cache;       // Standard mpv gpu/tone-map options.
+    struct m_config_cache *next_opts_cache;  // gpu-next-specific options.
 };
 
 /**
@@ -498,11 +500,20 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log,
 
     // Pre-find the texture formats we'll need for OSD bitmaps for efficiency.
     p->osd_fmt[SUBBITMAP_LIBASS] = ra_next_find_fmt(p->ra, PL_FMT_UNORM, 1, 8, 8, 0);
-    p->osd_fmt[SUBBITMAP_BGRA]   = ra_next_find_fmt(p->ra, PL_FMT_UNORM, 4, 8, 8, 0);
+    // Bitmap subtitles are uploaded as BGRA bytes by sd_lavc. Using an
+    // arbitrary four-component UNORM format can select RGBA and swap red/blue.
+    p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->ra->gpu, "bgra8");
+    if (!p->osd_fmt[SUBBITMAP_BGRA]) {
+        mp_msg(p->log, MSGL_WARN,
+               "No bgra8 texture format; bitmap subtitle colors may be incorrect.\n");
+        p->osd_fmt[SUBBITMAP_BGRA] =
+            ra_next_find_fmt(p->ra, PL_FMT_UNORM, 4, 8, 8, 0);
+    }
 
     // Create the state object that tracks brightness, contrast, etc.
     p->video_eq = mp_csp_equalizer_create(p, global);
     p->opts_cache = m_config_cache_alloc(p, global, &gl_video_conf);
+    p->next_opts_cache = m_config_cache_alloc(p, global, &gl_next_conf);
 
     if (p->ra_ctx && p->hwdec_devs) {
         p->hwdec_ctx = (struct ra_hwdec_ctx) {
@@ -573,6 +584,9 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
     if (!subs) return;
 
     frame->overlays = state->overlays;
+    m_config_cache_update(p->next_opts_cache);
+    int image_subs_hdr_peak =
+        gpu_next_get_image_subs_hdr_peak(p->next_opts_cache);
 
     // Iterate through each bitmap and convert it into a libplacebo overlay.
     for (int n = 0; n < subs->num_items; n++) {
@@ -649,7 +663,29 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
         if (item->format == SUBBITMAP_BGRA) {
             ol->mode = PL_OVERLAY_NORMAL;
             ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
-            if (src) ol->color = src->params.color;
+            if (src) {
+                ol->color = src->params.color;
+                if (pl_color_transfer_is_hdr(ol->color.transfer)) {
+                    bool use_static = image_subs_hdr_peak == -2;
+                    if (use_static || image_subs_hdr_peak == -3) {
+                        float max;
+                        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+                            .color      = &ol->color,
+                            .metadata   = use_static ? PL_HDR_METADATA_HDR10
+                                                     : PL_HDR_METADATA_ANY,
+                            .scaling    = PL_HDR_NITS,
+                            .out_max    = &max,
+                        ));
+                        ol->color.hdr = (struct pl_hdr_metadata) {
+                            .max_luma = max,
+                        };
+                    } else if (image_subs_hdr_peak != -1) {
+                        ol->color.hdr = (struct pl_hdr_metadata) {
+                            .max_luma = image_subs_hdr_peak,
+                        };
+                    }
+                }
+            }
         } else if (item->format == SUBBITMAP_LIBASS) {
             ol->mode = PL_OVERLAY_MONOCHROME;
             ol->repr.alpha = PL_ALPHA_INDEPENDENT;
