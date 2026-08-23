@@ -587,6 +587,8 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
     m_config_cache_update(p->next_opts_cache);
     int image_subs_hdr_peak =
         gpu_next_get_image_subs_hdr_peak(p->next_opts_cache);
+    int image_subs_colorspace =
+        gpu_next_get_image_subs_colorspace(p->next_opts_cache);
 
     // Iterate through each bitmap and convert it into a libplacebo overlay.
     for (int n = 0; n < subs->num_items; n++) {
@@ -663,7 +665,15 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
         if (item->format == SUBBITMAP_BGRA) {
             ol->mode = PL_OVERLAY_NORMAL;
             ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
-            if (src) {
+
+            bool use_video_colorspace = src &&
+                (image_subs_colorspace ==
+                     GPU_NEXT_IMAGE_SUBS_COLORSPACE_VIDEO ||
+                 (image_subs_colorspace ==
+                      GPU_NEXT_IMAGE_SUBS_COLORSPACE_AUTO &&
+                  !pl_color_transfer_is_hdr(src->params.color.transfer)));
+
+            if (use_video_colorspace) {
                 ol->color = src->params.color;
                 if (pl_color_transfer_is_hdr(ol->color.transfer)) {
                     bool use_static = image_subs_hdr_peak == -2;
@@ -685,6 +695,11 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
                         };
                     }
                 }
+            } else {
+                int peak = image_subs_hdr_peak;
+                ol->color = pl_color_space_srgb;
+                ol->color.hdr.max_luma = peak >= 10
+                    ? peak : PL_COLOR_SDR_WHITE;
             }
         } else if (item->format == SUBBITMAP_LIBASS) {
             ol->mode = PL_OVERLAY_MONOCHROME;

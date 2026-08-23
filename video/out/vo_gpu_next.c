@@ -178,6 +178,7 @@ struct gl_next_opts {
     bool delayed_peak;
     int sub_hdr_peak;
     int image_subs_hdr_peak;
+    int image_subs_colorspace;
     int border_background;
     float background_blur_radius;
     float corner_rounding;
@@ -206,6 +207,10 @@ const struct m_sub_options gl_next_conf = {
             M_RANGE(10, 10000)},
         {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
             {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
+        {"image-subs-colorspace", OPT_CHOICE(image_subs_colorspace,
+            {"video", GPU_NEXT_IMAGE_SUBS_COLORSPACE_VIDEO},
+            {"sdr", GPU_NEXT_IMAGE_SUBS_COLORSPACE_SDR},
+            {"auto", GPU_NEXT_IMAGE_SUBS_COLORSPACE_AUTO})},
         {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
         {"border-background", OPT_CHOICE(border_background,
             {"none",  BACKGROUND_NONE},
@@ -233,6 +238,7 @@ const struct m_sub_options gl_next_conf = {
         .inter_preserve = true,
         .sub_hdr_peak = PL_COLOR_SDR_WHITE,
         .image_subs_hdr_peak = 1000,
+        .image_subs_colorspace = GPU_NEXT_IMAGE_SUBS_COLORSPACE_VIDEO,
         .target_hint = -1,
         .target_hint_strict = true,
     },
@@ -244,6 +250,12 @@ int gpu_next_get_image_subs_hdr_peak(const struct m_config_cache *cache)
 {
     const struct gl_next_opts *opts = cache->opts;
     return opts->image_subs_hdr_peak;
+}
+
+int gpu_next_get_image_subs_colorspace(const struct m_config_cache *cache)
+{
+    const struct gl_next_opts *opts = cache->opts;
+    return opts->image_subs_colorspace;
 }
 
 static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
@@ -405,8 +417,17 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         case SUBBITMAP_BGRA:
             ol->mode = PL_OVERLAY_NORMAL;
             ol->repr.alpha = PL_ALPHA_PREMULTIPLIED;
-            // Infer bitmap colorspace from source
-            if (src) {
+
+            bool use_video_colorspace = src &&
+                (p->next_opts->image_subs_colorspace ==
+                     GPU_NEXT_IMAGE_SUBS_COLORSPACE_VIDEO ||
+                 (p->next_opts->image_subs_colorspace ==
+                      GPU_NEXT_IMAGE_SUBS_COLORSPACE_AUTO &&
+                  !pl_color_transfer_is_hdr(src->params.color.transfer)));
+
+            if (use_video_colorspace) {
+                // Preserve the historical behavior when explicitly requested,
+                // or for SDR video in auto mode.
                 ol->color = src->params.color;
                 if (pl_color_transfer_is_hdr(ol->color.transfer)) {
                     bool use_static = p->next_opts->image_subs_hdr_peak == -2;
@@ -427,6 +448,14 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                         };
                     }
                 }
+            } else {
+                // Bitmap subtitles are normally authored as SDR graphics. Do
+                // not make PGS/VobSub/DVB bitmaps inherit PQ/HLG/Dolby Vision
+                // transfer metadata when SDR or auto mode selects sRGB.
+                int peak = p->next_opts->image_subs_hdr_peak;
+                ol->color = pl_color_space_srgb;
+                ol->color.hdr.max_luma = peak >= 10
+                    ? peak : PL_COLOR_SDR_WHITE;
             }
             break;
         case SUBBITMAP_LIBASS:

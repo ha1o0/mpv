@@ -2812,8 +2812,23 @@ Subtitles
     ``video-dynamic`` uses only per-scene video metadata,
     ``video-static`` uses only static video metadata, (``--vo=gpu-next`` only)
 
+    Numeric values and ``sdr`` also control the diffuse white level when
+    ``--image-subs-colorspace`` selects SDR sRGB. The video metadata modes
+    fall back to standard SDR white in that path.
+
     This also affects image subtitle brightness in HDR tone mapping with
     ``--blend-subtitles=<yes|video>``.
+
+``--image-subs-colorspace=<video|sdr|auto>``
+    Controls the color space assigned to image subtitles such as PGS, VobSub,
+    and DVB subtitles (``--vo=gpu-next`` only).
+
+    ``video`` preserves the historical behavior and inherits the video color
+    space. ``sdr`` always treats image subtitles as SDR sRGB graphics.
+    ``auto`` uses SDR sRGB for HDR video and preserves the historical behavior
+    for SDR video. The default is ``video``.
+
+    This option does not affect text subtitles, OSD, or the video itself.
 
 ``--sub-hdr-peak=<sdr|10-10000>``
     Controls the text subtitle and OSD diffuse white level in cd/m² (nits)
