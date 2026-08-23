@@ -168,7 +168,7 @@ class Common: NSObject {
     func startDisplayLink(_ vo: UnsafeMutablePointer<vo>) {
         CVDisplayLinkCreateWithActiveCGDisplays(&link)
 
-        guard let screen = getTargetScreen(forFullscreen: false) ?? NSScreen.main,
+        guard let screen = getCurrentScreen(),
               let link = self.link else {
             log.warning("Couldn't start DisplayLink, no Screen or DisplayLink available")
             return
@@ -188,7 +188,7 @@ class Common: NSObject {
     }
 
     func updateDisplaylink() {
-        guard let screen = window?.screen, let link = self.link else {
+        guard let screen = getCurrentScreen(), let link = self.link else {
             log.warning("Couldn't update DisplayLink, no Screen or DisplayLink available")
             return
         }
@@ -404,9 +404,10 @@ class Common: NSObject {
     }
 
     func getCurrentScreen() -> NSScreen? {
-         return window != nil ? window?.screen :
-                                    getTargetScreen(forFullscreen: false) ??
-                                    NSScreen.main
+        return window?.screen ??
+               view?.window?.screen ??
+               getTargetScreen(forFullscreen: false) ??
+               NSScreen.main
     }
 
     func getWindowGeometry(forScreen screen: NSScreen,
@@ -555,7 +556,8 @@ class Common: NSObject {
             fps.pointee = currentFps()
             return VO_TRUE
         case VOCTRL_GET_WINDOW_ID:
-            guard let window = window else {
+            let hostWindow: NSWindow? = window ?? view?.window
+            guard let window = hostWindow else {
                 return VO_NOTAVAIL
             }
             let wid = data!.assumingMemoryBound(to: Int64.self)
@@ -565,6 +567,7 @@ class Common: NSObject {
             let scaleFactor = data!.assumingMemoryBound(to: CDouble.self)
             let screen = getCurrentScreen()
             let factor = window?.backingScaleFactor ??
+                         view?.window?.backingScaleFactor ??
                          screen?.backingScaleFactor ?? 1.0
             scaleFactor.pointee = Double(factor)
             return VO_TRUE
@@ -605,8 +608,12 @@ class Common: NSObject {
         case VOCTRL_GET_UNFS_WINDOW_SIZE:
             let sizeData = data!.assumingMemoryBound(to: Int32.self)
             let size = UnsafeMutableBufferPointer(start: sizeData, count: 2)
+            let embeddedRect = view.map {
+                Bool(option.vo.hidpi_window_scale) ? $0.bounds : $0.convertToBacking($0.bounds)
+            }
             let rect = (Bool(option.vo.hidpi_window_scale) ? window?.unfsContentFrame
-                : window?.unfsContentFramePixel) ?? NSRect(x: 0, y: 0, width: 1280, height: 720)
+                : window?.unfsContentFramePixel) ?? embeddedRect ??
+                NSRect(x: 0, y: 0, width: 1280, height: 720)
 
             size[0] = Int32(rect.size.width)
             size[1] = Int32(rect.size.height)

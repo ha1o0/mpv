@@ -114,10 +114,9 @@ static bool resize(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
 
-    if (!p->vo_mac.window) {
+    CGSize size = [p->vo_mac renderSize];
+    if (size.width < 1 || size.height < 1)
         return false;
-    }
-    CGSize size = p->vo_mac.window.framePixel.size;
 
     return ra_vk_ctx_resize(ctx, (int)size.width, (int)size.height);
 }

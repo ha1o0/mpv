@@ -17,8 +17,51 @@
 
 import Cocoa
 
+private class EmbeddedView: View {
+    private var screenObserver: NSObjectProtocol?
+
+    deinit {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+        }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let changed = frame.size != newSize
+        super.setFrameSize(newSize)
+        if changed {
+            (common as? MacCommon)?.embeddedViewDidResize()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+            self.screenObserver = nil
+        }
+        if let window {
+            screenObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeScreenNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                (self?.common as? MacCommon)?.embeddedViewDidMoveToWindow()
+            }
+        }
+        (common as? MacCommon)?.embeddedViewDidMoveToWindow()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        (common as? MacCommon)?.embeddedViewDidChangeBackingProperties()
+    }
+}
+
 class MacCommon: Common {
     @objc var layer: MetalLayer?
+
+    private var embeddedHostView: NSView?
 
     var presentation: Presentation?
     var timer: PreciseTimer?
@@ -36,12 +79,49 @@ class MacCommon: Common {
 
         DispatchQueue.main.sync {
             layer = MetalLayer(common: self)
+            if let hostView = resolveEmbeddedHostView(), let layer = layer {
+                embeddedHostView = hostView
+                let embeddedView = EmbeddedView(frame: hostView.bounds, common: self)
+                embeddedView.layer = layer
+                embeddedView.wantsLayer = true
+                embeddedView.layerContentsPlacement = .scaleProportionallyToFit
+                layer.delegate = embeddedView
+                layer.contentsScale = hostView.window?.backingScaleFactor ?? 1
+                view = embeddedView
+                hostView.addSubview(embeddedView)
+                log.verbose("Embedding macvk output in external NSView: \(hostView)")
+            }
             initMisc(vo)
         }
     }
 
+    private func resolveEmbeddedHostView() -> NSView? {
+        let windowID = option.vo.WinID
+        guard windowID > 0,
+              let pointer = UnsafeRawPointer(bitPattern: Int(windowID)) else {
+            return nil
+        }
+
+        let object = Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue()
+        guard let hostView = object as? NSView else {
+            log.error("macOS --wid must point to an NSView")
+            return nil
+        }
+        return hostView
+    }
+
     @objc func config(_ vo: UnsafeMutablePointer<vo>) -> Bool {
         eventsLock.withLock { self.vo = vo }
+
+        if let hostView = embeddedHostView {
+            DispatchQueue.main.sync {
+                view?.frame = hostView.bounds
+                layer?.contentsScale = hostView.window?.backingScaleFactor ?? 1
+                windowDidResize()
+                updateICCProfile()
+            }
+            return true
+        }
 
         DispatchQueue.main.sync {
             let previousActiveApp = getActiveApp()
@@ -77,16 +157,60 @@ class MacCommon: Common {
     }
 
     @objc func uninit(_ vo: UnsafeMutablePointer<vo>) {
-        window?.waitForAnimation()
+        if embeddedHostView == nil {
+            window?.waitForAnimation()
+        }
 
         timer?.terminate()
 
         DispatchQueue.main.sync {
-            window?.delegate = nil
-            window?.close()
+            if self.embeddedHostView == nil {
+                window?.delegate = nil
+                window?.close()
+            }
 
             uninitCommon()
+            view = nil
+            embeddedHostView = nil
         }
+    }
+
+    func embeddedViewDidResize() {
+        guard embeddedHostView != nil else { return }
+        windowDidResize()
+    }
+
+    func embeddedViewDidMoveToWindow() {
+        guard embeddedHostView != nil, view?.window != nil else { return }
+        if link != nil {
+            updateDisplaylink()
+        }
+        embeddedViewDidChangeBackingProperties()
+        updateICCProfile()
+    }
+
+    func embeddedViewDidChangeBackingProperties() {
+        guard embeddedHostView != nil else { return }
+        layer?.contentsScale = view?.window?.backingScaleFactor ?? 1
+        windowDidResize()
+    }
+
+    @objc func renderSize() -> CGSize {
+        var size = CGSize.zero
+        let updateSize = {
+            if self.embeddedHostView != nil, let view = self.view {
+                size = view.convertToBacking(view.bounds).size
+            } else {
+                size = self.window?.framePixel.size ?? CGSize.zero
+            }
+        }
+
+        if Thread.isMainThread {
+            updateSize()
+        } else {
+            DispatchQueue.main.sync(execute: updateSize)
+        }
+        return size
     }
 
     @objc func swapBuffer() {
@@ -110,9 +234,22 @@ class MacCommon: Common {
     }
 
     @objc func isVisible() -> Bool {
-        return window?.occlusionState.contains(.visible) ?? false ||
-               option.vo.force_render ||
-               needsInitialDraw
+        var visible = false
+        let updateVisibility = {
+            if let hostView = self.embeddedHostView {
+                visible = !hostView.isHidden &&
+                          (hostView.window?.occlusionState.contains(.visible) ?? false)
+            } else {
+                visible = self.window?.occlusionState.contains(.visible) ?? false
+            }
+        }
+
+        if Thread.isMainThread {
+            updateVisibility()
+        } else {
+            DispatchQueue.main.sync(execute: updateVisibility)
+        }
+        return visible || option.vo.force_render || needsInitialDraw
     }
 
     @objc func update(alpha: Bool) {
