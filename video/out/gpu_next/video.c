@@ -585,6 +585,7 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
 
     frame->overlays = state->overlays;
     m_config_cache_update(p->next_opts_cache);
+    int sub_hdr_peak = gpu_next_get_sub_hdr_peak(p->next_opts_cache);
     int image_subs_hdr_peak =
         gpu_next_get_image_subs_hdr_peak(p->next_opts_cache);
     int image_subs_colorspace =
@@ -704,7 +705,19 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
         } else if (item->format == SUBBITMAP_LIBASS) {
             ol->mode = PL_OVERLAY_MONOCHROME;
             ol->repr.alpha = PL_ALPHA_INDEPENDENT;
-            if (src && item->video_color_space) ol->color = src->params.color;
+            if (src && item->video_color_space &&
+                !pl_color_space_is_hdr(&src->params.color))
+                ol->color = src->params.color;
+            if (src && pl_color_space_is_hdr(&src->params.color)) {
+                // The libmpv render API composites these overlays into an
+                // application-owned target instead of vo_gpu_next's
+                // swapchain. Keep HDR-video subtitles in sRGB and tag their
+                // diffuse white explicitly so runtime --sub-hdr-peak changes
+                // reach this rendering path.
+                ol->color.hdr = (struct pl_hdr_metadata) {
+                    .max_luma = sub_hdr_peak,
+                };
+            }
         }
     }
 

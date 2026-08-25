@@ -246,6 +246,12 @@ const struct m_sub_options gl_next_conf = {
     .change_flags = UPDATE_VIDEO,
 };
 
+int gpu_next_get_sub_hdr_peak(const struct m_config_cache *cache)
+{
+    const struct gl_next_opts *opts = cache->opts;
+    return opts->sub_hdr_peak;
+}
+
 int gpu_next_get_image_subs_hdr_peak(const struct m_config_cache *cache)
 {
     const struct gl_next_opts *opts = cache->opts;
@@ -461,7 +467,12 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         case SUBBITMAP_LIBASS:
             if (src && item->video_color_space && !pl_color_space_is_hdr(&src->params.color))
                 ol->color = src->params.color;
-            if (src && pl_color_transfer_is_hdr(frame->color.transfer)) {
+            if (src && (pl_color_space_is_hdr(&frame->color) ||
+                        pl_color_space_is_hdr(&src->params.color))) {
+                // Some application-owned or platform swapchains do not expose
+                // their HDR transfer reliably. An HDR source still needs the
+                // configured subtitle diffuse white instead of silently
+                // falling back to untagged SDR metadata.
                 ol->color.hdr = (struct pl_hdr_metadata) {
                     .max_luma = p->next_opts->sub_hdr_peak,
                 };
