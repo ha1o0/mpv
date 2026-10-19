@@ -4087,6 +4087,38 @@ Demuxer
     If this option is deemed unnecessary at some point in the future, it will
     be removed without notice.
 
+``--demuxer-mkv-skip-tags=<yes|no>``
+    Ignore Matroska Tags elements (default: no). This is a downstream extension,
+    not an upstream mpv option. Set it before loading the file.
+
+    This can avoid a seek to trailing metadata when opening a remote file. It
+    discards Tags for this load; they are not fetched in the background later.
+    File, track, chapter and edition metadata stored in Tags, including
+    ReplayGain information, will be unavailable. Track definitions, Chapters
+    and Attachments (including subtitle fonts) are still read normally.
+
+    The default preserves the normal metadata handling. With this option
+    enabled, the existing automatic cues deferral can apply if Cues become the
+    only remaining header element after the first Cluster.
+
+``--demuxer-mkv-defer-cues=<yes|no>``
+    Defer reading Matroska Cues referenced after the first Cluster, even if
+    other trailing header elements must be read (default: no). This is a
+    downstream extension, not an upstream mpv option. Set it before loading
+    the file.
+
+    Cues encountered sequentially before the first Cluster are still parsed.
+    Deferred cues remain available to the normal seek and duration-probing
+    paths, subject to ``--index``. They are not loaded by a background task.
+    This can move network and parsing work from startup to the first seek or
+    a nonzero resume position. ``--demuxer-mkv-probe-video-duration`` can also
+    require them during startup. Other trailing metadata, including Tags,
+    continues to be read unless separately disabled.
+
+    The default retains mpv's existing behavior: cues are deferred automatically
+    when they are the only remaining header element after the first Cluster.
+    This option does not imply ``--index=recreate`` or disable seeking.
+
 ``--demuxer-mkv-subtitle-preroll=<yes|index|no>``
     Try harder to show embedded soft subtitles when seeking somewhere. Normally,
     it can happen that the subtitle at the seek target is not shown due to how

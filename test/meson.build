@@ -163,6 +163,13 @@ if get_option('libmpv')
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
+        # ctypes loads the built library into the host Python process. Run
+        # cross-built libraries separately on their target with this script.
+        if not meson.is_cross_build()
+            test('libmpv-mkv-startup', python,
+                 args: [files('mkv_startup.py'), '--libmpv', mpvlib.full_path()],
+                 depends: mpvlib, timeout: 300, suite: 'libmpv')
+        endif
     endif
 endif
 

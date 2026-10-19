@@ -245,6 +245,8 @@ struct demux_mkv_opts {
     int probe_duration;
     bool probe_start_time;
     bool crop_compat;
+    bool skip_tags;
+    bool defer_cues;
 };
 
 const struct m_sub_options demux_mkv_conf = {
@@ -259,6 +261,8 @@ const struct m_sub_options demux_mkv_conf = {
             {"no", 0}, {"yes", 1}, {"full", 2})},
         {"probe-start-time", OPT_BOOL(probe_start_time)},
         {"crop-compat", OPT_BOOL(crop_compat)},
+        {"skip-tags", OPT_BOOL(skip_tags)},
+        {"defer-cues", OPT_BOOL(defer_cues)},
         {0}
     },
     .size = sizeof(struct demux_mkv_opts),
@@ -1405,8 +1409,23 @@ static struct header_elem *get_header_element(struct demuxer *demuxer,
     return &mkv_d->headers[mkv_d->num_headers - 1];
 }
 
+// Also used before seeking, including for headers discovered by another
+// SeekHead. Skipping only inside read_header_element() would still cause I/O.
+static bool skip_header_element(struct demuxer *demuxer,
+                                struct header_elem *elem)
+{
+    struct mkv_demuxer *mkv_d = demuxer->priv;
+
+    if (!elem->parsed && elem->id == MATROSKA_ID_TAGS && mkv_d->opts->skip_tags) {
+        elem->parsed = true;
+        MP_VERBOSE(demuxer, "Ignoring header element 0x%"PRIx32
+                   " due to demuxer option.\n", elem->id);
+    }
+    return elem->parsed;
+}
+
 // Mark the level 1 element with the given id as read. Return whether it
-// was marked read before (e.g. for checking whether it was already read).
+// should be skipped (already read, or explicitly ignored).
 // element_filepos refers to the file position of the element ID.
 static bool test_header_element(struct demuxer *demuxer, uint32_t id,
                                 int64_t element_filepos)
@@ -1414,7 +1433,7 @@ static bool test_header_element(struct demuxer *demuxer, uint32_t id,
     struct header_elem *elem = get_header_element(demuxer, id, element_filepos);
     if (!elem)
         return false;
-    if (elem->parsed)
+    if (skip_header_element(demuxer, elem))
         return true;
     elem->parsed = true;
     return false;
@@ -2474,7 +2493,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
     int only_cue = -1;
     for (int n = 0; n < mkv_d->num_headers; n++) {
         struct header_elem *elem = &mkv_d->headers[n];
-        if (elem->parsed)
+        if (skip_header_element(demuxer, elem))
             continue;
         // Warn against incomplete files and skip headers outside of range.
         if (elem->pos >= end || !s->seekable) {
@@ -2501,12 +2520,19 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
     } else {
         // Read them by ascending position to reduce unneeded seeks.
         // O(n^2) because the number of elements is very low.
+        bool deferred_cues = false;
         while (1) {
             struct header_elem *lowest = NULL;
             for (int n = 0; n < mkv_d->num_headers; n++) {
                 struct header_elem *elem = &mkv_d->headers[n];
-                if (elem->parsed)
+                if (skip_header_element(demuxer, elem))
                     continue;
+                // Leave cues unparsed so read_deferred_cues() can read them
+                // for a seek or duration probe. Other headers remain required.
+                if (mkv_d->opts->defer_cues && elem->id == MATROSKA_ID_CUES) {
+                    deferred_cues = true;
+                    continue;
+                }
                 if (!lowest || elem->pos < lowest->pos)
                     lowest = elem;
             }
@@ -2517,6 +2543,8 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
             if (read_deferred_element(demuxer, lowest) < 0)
                 return -1;
         }
+        if (deferred_cues)
+            MP_VERBOSE(demuxer, "Deferring reading cues.\n");
     }
 
     if (!stream_seek(s, start_pos)) {
