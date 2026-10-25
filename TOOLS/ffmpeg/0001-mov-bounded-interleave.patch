@@ -1,0 +1,342 @@
+From: Floe contributors <recipe@example.invalid>
+Subject: [PATCH] avformat/mov: add opt-in bounded physical read runs
+
+Keep legacy ordering by default. Limit physical runs by a fixed DTS window and
+a window byte budget; drain sparse subtitles before advancing the window.
+Only activate for widely separated selected A/V tracks in seekable flat files.
+Seek cursor reconstruction, fragmented inputs and external IO stay unchanged.
+
+Design reference: VLC modules/demux/mp4/mp4.c DemuxMoov / DemuxTrack:
+https://github.com/videolan/vlc/blob/master/modules/demux/mp4/mp4.c
+The implementation here is independent and does not copy VLC/Hills source.
+
+---
+diff --git a/libavformat/mov.c b/libavformat/mov.c
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -11242,6 +11242,7 @@
+     int i;
+ 
+     mov->fc = s;
++    ff_mov_bounded_reset(&mov->bounded_interleave);
+     mov->trak_index = -1;
+     mov->primary_item_id = -1;
+     mov->cur_item_id = -1;
+@@ -11463,7 +11464,7 @@
+     return 0;
+ }
+ 
+-static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
++static AVIndexEntry *mov_find_next_sample_legacy(AVFormatContext *s, AVStream **st)
+ {
+     AVIndexEntry *sample = NULL;
+     int64_t best_dts = INT64_MAX;
+@@ -11493,6 +11494,67 @@
+     return sample;
+ }
+ 
++static int mov_bounded_get_sample(void *opaque, unsigned i, MOVBoundedSample *out)
++{
++    AVFormatContext *s = opaque;
++    AVStream *st = s->streams[i];
++    MOVStreamContext *sc = st->priv_data;
++    FFStream *sti = ffstream(st);
++    AVIndexEntry *entry;
++
++    if (sc->iamf)
++        return -1;
++    if (st->discard == AVDISCARD_ALL ||
++        (st->disposition & AV_DISPOSITION_ATTACHED_PIC) || !sc->pb ||
++        sc->current_sample >= sti->nb_index_entries)
++        return 0;
++    // External references and IAMF retain their existing stream ownership and
++    // packet expansion rules. Missing/invalid clocks also use legacy order.
++    if (sc->pb != s->pb || sc->time_scale <= 0)
++        return -1;
++    entry = &sti->index_entries[sc->current_sample];
++    if (entry->timestamp == AV_NOPTS_VALUE)
++        return -1;
++    *out = (MOVBoundedSample){
++        .dts = av_rescale(entry->timestamp, AV_TIME_BASE, sc->time_scale),
++        .pos = entry->pos,
++        .anchor = st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO ||
++                  st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO,
++    };
++    return 1;
++}
++
++static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
++{
++    MOVContext *mov = s->priv_data;
++    AVIndexEntry *sample = mov_find_next_sample_legacy(s, st);
++    int was_active = mov->bounded_interleave.valid;
++    int chosen;
++
++    // Keep fragmented/live inputs, explicit physical order, and discarded
++    // track cursor advancement exactly as before. Bounded scheduling changes
++    // only the delivery order of selected samples in a complete flat index.
++    if (!sample || !mov->interleave_strategy || !mov->interleaved_read ||
++        !(s->pb->seekable & AVIO_SEEKABLE_NORMAL) ||
++        s->nb_stream_groups ||
++        mov->frag_index.nb_items || mov->fragment.moof_offset || mov->next_root_atom ||
++        (*st)->discard == AVDISCARD_ALL)
++        return sample;
++
++    chosen = ff_mov_bounded_choose(&mov->bounded_interleave, s->nb_streams, s,
++                                  mov_bounded_get_sample,
++                                  mov->interleave_preload_duration,
++                                  mov->interleave_preload_max_bytes);
++    if (chosen < 0)
++        return sample;
++    if (!was_active && mov->bounded_interleave.valid)
++        av_log(s, AV_LOG_VERBOSE, "Bounded MP4 interleave activated: duration=%"PRId64
++               " us bytes=%"PRId64"\n", mov->interleave_preload_duration,
++               mov->interleave_preload_max_bytes);
++    *st = s->streams[chosen];
++    return &ffstream(*st)->index_entries[((MOVStreamContext *)(*st)->priv_data)->current_sample];
++}
++
+ static int should_retry(AVIOContext *pb, int error_code) {
+     if (error_code == AVERROR_EOF || avio_feof(pb))
+         return 0;
+@@ -11888,6 +11950,7 @@
+         return ret;
+     }
+ 
++    ff_mov_bounded_record(&mov->bounded_interleave, st->index, pkt->size);
+     return 0;
+ }
+ 
+@@ -12053,6 +12116,8 @@
+     int sample;
+     int i;
+ 
++    ff_mov_bounded_reset(&mc->bounded_interleave);
++
+     if (stream_index >= s->nb_streams)
+         return AVERROR_INVALIDDATA;
+ 
+@@ -12089,7 +12154,7 @@
+         }
+         while (1) {
+             MOVStreamContext *sc;
+-            AVIndexEntry *entry = mov_find_next_sample(s, &st);
++            AVIndexEntry *entry = mov_find_next_sample_legacy(s, &st);
+             if (!entry)
+                 return AVERROR_INVALIDDATA;
+             sc = st->priv_data;
+@@ -12153,6 +12218,16 @@
+         {.i64 = 0}, 0, 1, FLAGS },
+     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
+     { "interleaved_read", "Interleave packets from multiple tracks at demuxer level", OFFSET(interleaved_read), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, .flags = AV_OPT_FLAG_DECODING_PARAM },
++    { "interleave_strategy", "Packet read ordering for flat MOV/MP4", OFFSET(interleave_strategy),
++        AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, FLAGS, .unit = "interleave_strategy" },
++    { "legacy", "Use the existing DTS/file-position heuristic", 0,
++        AV_OPT_TYPE_CONST, {.i64 = 0}, 0, 0, FLAGS, .unit = "interleave_strategy" },
++    { "bounded", "Use bounded physical runs for widely separated selected tracks", 0,
++        AV_OPT_TYPE_CONST, {.i64 = 1}, 0, 0, FLAGS, .unit = "interleave_strategy" },
++    { "interleave_preload_duration", "Maximum DTS preload window for bounded interleave", OFFSET(interleave_preload_duration),
++        AV_OPT_TYPE_DURATION, {.i64 = 5 * AV_TIME_BASE}, 0, 30 * AV_TIME_BASE, FLAGS },
++    { "interleave_preload_max_bytes", "Logical preload byte budget before catching up lagging tracks", OFFSET(interleave_preload_max_bytes),
++        AV_OPT_TYPE_INT64, {.i64 = 8 * 1024 * 1024}, 0, 64 * 1024 * 1024, FLAGS },
+ 
+     { NULL },
+ };
+diff --git a/libavformat/isom.h b/libavformat/isom.h
+--- a/libavformat/isom.h
++++ b/libavformat/isom.h
+@@ -35,6 +35,7 @@
+ 
+ #include "avio.h"
+ #include "internal.h"
++#include "mov_bounded_interleave.h"
+ #include "dv.h"
+ 
+ /* isom.c */
+@@ -389,6 +390,10 @@
+     int nb_heif_grid;
+     int64_t idat_offset;
+     int interleaved_read;
++    int interleave_strategy;
++    int64_t interleave_preload_duration;
++    int64_t interleave_preload_max_bytes;
++    MOVBoundedInterleave bounded_interleave;
+     AVDictionary* decryption_keys;
+     unsigned heif_icc_profile_items;
+ } MOVContext;
+diff --git a/libavformat/mov_bounded_interleave.h b/libavformat/mov_bounded_interleave.h
+new file mode 100644
+--- /dev/null
++++ b/libavformat/mov_bounded_interleave.h
+@@ -0,0 +1,171 @@
++/*
++ * Bounded MOV/MP4 physical read runs.
++ * Copyright (c) 2026 Floe contributors
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU Lesser General Public License as published by the
++ * Free Software Foundation; either version 2.1 of the License, or (at your
++ * option) any later version.
++ * FFmpeg is distributed in the hope that it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for
++ * more details.
++ */
++
++#ifndef AVFORMAT_MOV_BOUNDED_INTERLEAVE_H
++#define AVFORMAT_MOV_BOUNDED_INTERLEAVE_H
++
++#include <limits.h>
++#include <stdint.h>
++
++typedef struct MOVBoundedSample {
++    int64_t dts; /* microseconds, after edit-list/index timestamp adjustment */
++    int64_t pos;
++    int anchor; /* selected audio/video, excluding attached pictures */
++} MOVBoundedSample;
++
++typedef struct MOVBoundedInterleave {
++    int valid;
++    int disabled;
++    int capped;
++    int last_av_stream;
++    uint64_t active_mask;
++    uint64_t anchor_mask;
++    int64_t start;
++    int64_t end;
++    int64_t window_bytes;
++} MOVBoundedInterleave;
++
++/* Return 1 for a selected pending sample, 0 for no sample, -1 if unsupported. */
++typedef int (*MOVBoundedGetSample)(void *, unsigned, MOVBoundedSample *);
++
++static inline void ff_mov_bounded_reset(MOVBoundedInterleave *b)
++{
++    *b = (MOVBoundedInterleave){ .last_av_stream = -1 };
++}
++
++static inline int64_t ff_mov_bounded_add(int64_t a, int64_t positive)
++{
++    return a > INT64_MAX - positive ? INT64_MAX : a + positive;
++}
++
++/*
++ * Prefer physical order inside a FIXED time window. Sliding a window after
++ * every audio packet releases only one more video packet at its boundary,
++ * recreating the very HTTP seek ping-pong this policy is intended to avoid.
++ *
++ * Accumulate the byte budget across the entire window, including intervening
++ * subtitle or other packets. Packet-stream switches must not reset it. When exhausted,
++ * shorten the window to the last selected A/V stream's next DTS and drain the
++ * lagging tracks before opening another window. Mandatory catch-up packets
++ * and a single large packet are not discarded to satisfy a byte budget.
++ * No packet storage is allocated here.
++ *
++ * This follows VLC's MP4 DemuxMoov/DemuxTrack design of physical-position
++ * preference with bounded DTS preload; it is not a port of VLC or Hills code.
++ */
++static inline int ff_mov_bounded_choose(MOVBoundedInterleave *b,
++                                        unsigned count, void *opaque,
++                                        MOVBoundedGetSample get,
++                                        int64_t duration, int64_t bytes)
++{
++    int64_t minimum = INT64_MAX, anchor = INT64_MAX;
++    int64_t low_pos = INT64_MAX, high_pos = 0;
++    unsigned anchors = 0;
++    uint64_t active_mask = 0, anchor_mask = 0;
++    MOVBoundedSample sample;
++
++    if (b->disabled || duration <= 0 || bytes <= 0)
++        return -1;
++    for (unsigned i = 0; i < count; i++) {
++        int available = get(opaque, i, &sample);
++        if (available < 0 || (available && (sample.dts == INT64_MIN ||
++            sample.dts == INT64_MAX || sample.pos < 0))) {
++            ff_mov_bounded_reset(b);
++            return -1;
++        }
++        if (!available)
++            continue;
++        // Avoid a lossy hash for detecting track selection changes. Files
++        // with selected stream indices outside this exact mask stay legacy.
++        if (i >= 64) {
++            ff_mov_bounded_reset(b);
++            return -1;
++        }
++        active_mask |= UINT64_C(1) << i;
++        if (sample.dts < minimum)
++            minimum = sample.dts;
++        if (!sample.anchor)
++            continue;
++        anchor_mask |= UINT64_C(1) << i;
++        anchors++;
++        if (sample.dts < anchor)
++            anchor = sample.dts;
++        if (sample.pos < low_pos)
++            low_pos = sample.pos;
++        if (sample.pos > high_pos)
++            high_pos = sample.pos;
++    }
++    if (anchors < 2) {
++        ff_mov_bounded_reset(b);
++        return -1;
++    }
++    if (b->valid && active_mask != b->active_mask)
++        ff_mov_bounded_reset(b);
++    // Ordinary interleaved MP4s keep the exact legacy packet order. Activate
++    // only when pending selected audio/video occupy widely separated regions.
++    if (!b->valid && high_pos - low_pos < 1024 * 1024)
++        return -1;
++    if (!b->valid || anchor < b->start || minimum >= b->end) {
++        b->valid = 1;
++        b->active_mask = active_mask;
++        b->anchor_mask = anchor_mask;
++        b->capped = 0;
++        b->start = anchor;
++        b->end = ff_mov_bounded_add(anchor, duration);
++        b->last_av_stream = -1;
++        b->window_bytes = 0;
++    }
++    if (!b->capped && b->last_av_stream >= 0 && b->window_bytes >= bytes &&
++        get(opaque, b->last_av_stream, &sample) > 0) {
++        // Degenerate non-advancing timestamps cannot bound a physical run.
++        // Retain legacy scheduling until the next seek rather than read a
++        // complete track under the guise of a small time window.
++        if (sample.dts <= b->start) {
++            b->disabled = 1;
++            return -1;
++        }
++        if (sample.dts > anchor && sample.dts < b->end) {
++            b->end = sample.dts;
++            b->capped = 1;
++        }
++    }
++
++    int selected = -1;
++    int64_t position = INT64_MAX;
++    for (unsigned i = 0; i < count; i++) {
++        if (get(opaque, i, &sample) > 0 && sample.dts < b->end &&
++            (selected < 0 || sample.pos < position)) {
++            selected = i;
++            position = sample.pos;
++        }
++    }
++    if (selected < 0)
++        ff_mov_bounded_reset(b);
++    return selected;
++}
++
++static inline void ff_mov_bounded_record(MOVBoundedInterleave *b,
++                                        int stream, int64_t bytes)
++{
++    if (!b->valid || bytes <= 0)
++        return;
++    if (stream >= 0 && stream < 64 &&
++        (b->anchor_mask & (UINT64_C(1) << stream)))
++        b->last_av_stream = stream;
++    b->window_bytes = ff_mov_bounded_add(b->window_bytes, bytes);
++}
++
++#endif

@@ -52,6 +52,7 @@
 #include "stream/stream_curl.h"
 
 #include "demux.h"
+#include "lavf_mp4_policy.h"
 #include "stheader.h"
 #include "options/m_config.h"
 #include "options/m_option.h"
@@ -81,6 +82,9 @@ struct demux_lavf_opts {
     int rtsp_transport;
     int linearize_ts;
     bool propagate_opts;
+    int mp4_read_strategy;
+    double mp4_preload_secs;
+    int64_t mp4_preload_bytes;
 };
 
 const struct m_sub_options demux_lavf_conf = {
@@ -110,6 +114,13 @@ const struct m_sub_options demux_lavf_conf = {
         {"demuxer-lavf-linearize-timestamps", OPT_CHOICE(linearize_ts,
             {"no", 0}, {"auto", -1}, {"yes", 1})},
         {"demuxer-lavf-propagate-opts", OPT_BOOL(propagate_opts)},
+        {"demuxer-lavf-mp4-read-strategy", OPT_CHOICE(mp4_read_strategy,
+            {"legacy", LAVF_MP4_LEGACY}, {"auto", LAVF_MP4_AUTO},
+            {"bounded", LAVF_MP4_BOUNDED})},
+        {"demuxer-lavf-mp4-preload-secs", OPT_DOUBLE(mp4_preload_secs),
+            M_RANGE(0, 30)},
+        {"demuxer-lavf-mp4-preload-bytes", OPT_BYTE_SIZE(mp4_preload_bytes),
+            M_RANGE(0, 64 * 1024 * 1024)},
         {0}
     },
     .size = sizeof(struct demux_lavf_opts),
@@ -125,6 +136,9 @@ const struct m_sub_options demux_lavf_conf = {
         .rtsp_transport = 2,
         .linearize_ts = -1,
         .propagate_opts = true,
+        .mp4_read_strategy = LAVF_MP4_AUTO,
+        .mp4_preload_secs = 5,
+        .mp4_preload_bytes = 8 * 1024 * 1024,
     },
     .change_flags = UPDATE_DEMUXER,
 };
@@ -1307,6 +1321,60 @@ static void handle_stream_groups(demuxer_t *demuxer)
 }
 #endif
 
+static void setup_mp4_bounded_interleave(struct demuxer *demuxer)
+{
+    lavf_priv_t *priv = demuxer->priv;
+    struct demux_lavf_opts *opts = priv->opts;
+    AVFormatContext *avfc = priv->avfc;
+    bool explicit_interleave = false;
+    bool finite_duration = avfc->duration > 0;
+    bool stream_groups = false;
+
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(60, 19, 100)
+    stream_groups = avfc->nb_stream_groups > 0;
+#endif
+
+    for (unsigned n = 0; n < avfc->nb_streams; n++)
+        finite_duration |= avfc->streams[n]->duration > 0;
+    for (int n = 0; opts->avopts && opts->avopts[2 * n]; n++) {
+        const char *key = opts->avopts[2 * n];
+        explicit_interleave |= strcmp(key, "interleaved_read") == 0 ||
+                               strcmp(key, "interleave_strategy") == 0 ||
+                               strcmp(key, "interleave_preload_duration") == 0 ||
+                               strcmp(key, "interleave_preload_max_bytes") == 0;
+    }
+    if (!priv->stream || !avfc->pb || !avfc->priv_data ||
+        stream_groups ||
+        !lavf_mp4_use_bounded(opts->mp4_read_strategy,
+                             matches_avinputformat_name(priv, "mov"),
+                             avfc->pb->seekable & AVIO_SEEKABLE_NORMAL,
+                             finite_duration, demuxer->is_network,
+                             priv->stream->url, explicit_interleave) ||
+        !(opts->mp4_preload_secs > 0))
+        return;
+
+    int64_t budget = lavf_mp4_preload_budget(opts->mp4_preload_bytes,
+                                           demuxer->opts->max_bytes);
+    if (!budget)
+        return;
+    // The FFmpeg extension is optional. Older/system libraries keep their
+    // original packet order instead of failing to open or ignoring user opts.
+    if (!av_opt_find(avfc->priv_data, "interleave_strategy", NULL, 0, 0)) {
+        MP_VERBOSE(demuxer, "Bounded MP4 interleave unavailable in this FFmpeg.\n");
+        return;
+    }
+    if (av_opt_set_int(avfc->priv_data, "interleave_preload_duration",
+                       (int64_t)(opts->mp4_preload_secs * AV_TIME_BASE), 0) < 0 ||
+        av_opt_set_int(avfc->priv_data, "interleave_preload_max_bytes", budget, 0) < 0 ||
+        av_opt_set(avfc->priv_data, "interleave_strategy", "bounded", 0) < 0)
+    {
+        MP_VERBOSE(demuxer, "Could not configure bounded MP4 interleave.\n");
+        return;
+    }
+    MP_VERBOSE(demuxer, "Bounded MP4 interleave: time=%.3f bytes=%"PRId64".\n",
+               opts->mp4_preload_secs, budget);
+}
+
 static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
 {
     AVFormatContext *avfc = NULL;
@@ -1475,6 +1543,10 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
         MP_VERBOSE(demuxer, "avformat_find_stream_info() finished after %"PRId64
                    " bytes.\n", stream_tell(priv->stream));
     }
+
+    // Header/stream probing must retain its original read behavior. Only
+    // normal packet delivery opts into the companion FFmpeg extension.
+    setup_mp4_bounded_interleave(demuxer);
 
     for (int i = 0; i < avfc->nb_chapters; i++) {
         AVChapter *c = avfc->chapters[i];

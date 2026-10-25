@@ -4053,6 +4053,33 @@ Demuxer
     case of MPEG-TS this value identifies the maximum number of TS packets
     to scan.
 
+``--demuxer-lavf-mp4-read-strategy=<auto|legacy|bounded>``
+    Select packet ordering for seekable MOV/MP4 files (default: ``auto``).
+    Requires the companion FFmpeg bounded-interleave extension described in
+    ``TOOLS/ffmpeg/README.md``. With an unpatched FFmpeg, retain legacy behavior.
+
+    ``auto`` opts in only for HTTP(S) network files with a finite duration.
+    Files whose pending selected audio/video positions stay less than 1 MiB
+    apart retain their packet order. Large chunks can qualify too. ``legacy`` disables
+    this opt-in. ``bounded`` also permits explicit testing on local MOV/MP4.
+    Fragmented and non-seekable inputs retain legacy ordering. Explicit
+    ``--demuxer-lavf-o`` interleave options take precedence. Other demuxers,
+    including mpv's Matroska demuxer, are unaffected.
+
+``--demuxer-lavf-mp4-preload-secs=<0-30>``
+    Maximum fixed DTS preload window for bounded MP4 physical read runs
+    (default: 5 seconds). A value of 0 disables mpv's opt-in. A fixed window
+    avoids releasing one more video packet after every small audio packet.
+
+``--demuxer-lavf-mp4-preload-bytes=<bytesize>``
+    Logical preload byte budget per fixed time window (default: 8 MiB).
+    The count accumulates across packets from different tracks, including subtitles.
+    The effective budget is at most one quarter of the forward demuxer cache.
+    Very small caches and a zero budget retain legacy behavior. Lagging tracks
+    must catch up before opening another time window; no packets are discarded
+    to meet the budget. Mandatory catch-up packets or one oversized packet can
+    exceed it. This setting does not allocate another byte or packet cache.
+
 ``--demuxer-lavf-buffersize=<value>``
     Size of the stream read buffer allocated for libavformat in bytes
     (default: 32768). Lowering the size could lower latency. Note that
