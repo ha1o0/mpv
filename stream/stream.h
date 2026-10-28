@@ -152,6 +152,7 @@ typedef struct stream {
     int mode; //STREAM_READ or STREAM_WRITE
     int stream_origin; // any STREAM_ORIGIN_*
     void *priv; // used for DVD, TV, RTSP etc
+    void *floe_cache; // optional native Floe persistent byte cache wrapper
     char *url;  // filename/url (possibly including protocol prefix)
     char *path; // filename (url without protocol prefix)
     char *mime_type; // when HTTP streaming is used

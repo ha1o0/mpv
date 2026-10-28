@@ -5643,6 +5643,26 @@ Cache
     See ``--list-options`` for defaults and value range. ``<bytesize>`` options
     accept suffixes such as ``KiB`` and ``MiB``.
 
+``--floe-cache-enabled=<yes|no>``
+    Enable Floe's persistent byte cache wrapper for eligible HTTP and HTTPS
+    streams (default: no). When disabled, stream callbacks and the underlying
+    transport are left unchanged.
+
+``--floe-cache-dir=<path>``
+    Root directory for Floe's persistent byte cache. The cache manager creates
+    its own ``floe-cache`` subdirectory below this path. This option has no
+    effect unless ``--floe-cache-enabled=yes`` and ``--floe-cache-key`` are
+    set.
+
+``--floe-cache-key=<string>``
+    Stable media identity used to share cached bytes between transport URLs,
+    such as a direct HTTP URL and a Floe loopback URL. The application must
+    change this value when the underlying media variant changes.
+
+``--floe-cache-max-bytes=<bytesize>``
+    Maximum total size of Floe's persistent byte cache (default: 5GiB). The
+    least recently used chunks are evicted when the limit is exceeded.
+
 ``--vd-queue-enable=<yes|no>, --ad-queue-enable``
     Enable running the video/audio decoder on a separate thread (default: no).
     If enabled, the decoder is run on a separate thread, and a frame queue is

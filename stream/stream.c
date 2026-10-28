@@ -38,6 +38,7 @@
 #include "options/path.h"
 #include "osdep/timer.h"
 #include "stream.h"
+#include "stream_floe_cache.h"
 
 #include "options/m_option.h"
 #include "options/m_config.h"
@@ -108,6 +109,10 @@ static const stream_info_t *const stream_list[] = {
 struct stream_opts {
     int64_t buffer_size;
     bool load_unsafe_playlists;
+    bool floe_cache_enabled;
+    char *floe_cache_dir;
+    char *floe_cache_key;
+    int64_t floe_cache_max_bytes;
 };
 
 #define OPT_BASE_STRUCT struct stream_opts
@@ -117,11 +122,17 @@ const struct m_sub_options stream_conf = {
         {"stream-buffer-size", OPT_BYTE_SIZE(buffer_size),
             M_RANGE(STREAM_MIN_BUFFER_SIZE, STREAM_MAX_BUFFER_SIZE)},
         {"load-unsafe-playlists", OPT_BOOL(load_unsafe_playlists)},
+        {"floe-cache-enabled", OPT_BOOL(floe_cache_enabled)},
+        {"floe-cache-dir", OPT_STRING(floe_cache_dir), .flags = M_OPT_FILE},
+        {"floe-cache-key", OPT_STRING(floe_cache_key)},
+        {"floe-cache-max-bytes", OPT_BYTE_SIZE(floe_cache_max_bytes),
+            M_RANGE(0, INT64_MAX)},
         {0}
     },
     .size = sizeof(struct stream_opts),
     .defaults = &(const struct stream_opts){
         .buffer_size = 128 * 1024,
+        .floe_cache_max_bytes = 5LL * 1024 * 1024 * 1024,
     },
 };
 
@@ -415,6 +426,14 @@ static int stream_create_instance(const stream_info_t *sinfo,
         free_stream(s);
         return STREAM_ERROR;
     }
+
+    struct floe_cache_stream_options floe_cache_options = {
+        .enabled = opts->floe_cache_enabled,
+        .directory = opts->floe_cache_dir,
+        .key = opts->floe_cache_key,
+        .max_bytes = opts->floe_cache_max_bytes,
+    };
+    stream_floe_cache_wrap(s, &floe_cache_options);
 
     mp_assert(s->seekable == !!s->seek);
 

@@ -2664,6 +2664,14 @@ Property list
         Sum of packet bytes (plus some overhead estimation) of the entire packet
         queue, including cached seekable ranges.
 
+``floe-cache-state``
+    Returns the persistent byte-cache state for the current stream when Floe's
+    native cache wrapper is enabled. The map contains ``key``, ``directory``,
+    ``max-bytes``, ``cached-bytes`` and ``file-size`` when known. ``ranges``
+    is an array of byte ranges with ``start`` and ``end`` offsets. These are
+    byte ranges, not timestamps; applications may combine them with demuxer
+    timing information when rendering persistent cache coverage.
+
 ``demuxer-via-network``
     Whether the stream demuxed via the main demuxer is most likely played via
     network. What constitutes "network" is not always clear, might be used for
