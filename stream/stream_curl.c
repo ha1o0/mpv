@@ -1331,17 +1331,63 @@ void mp_curl_avio_close(AVIOContext *pb, void *cookie)
 struct floe_curl_stream {
     struct priv curl; // must remain first for the existing callbacks/destructor
     struct floe_cache_http_response expected, response;
-    bool conditional_added, rejected;
+    bool conditional_added, rejected, passthrough;
 };
 
-struct mp_network_opts *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s)
+struct floe_cache_curl_session {
+    struct mp_network_opts *network;
+    struct curl_opts *options;
+    CURLSH *cookies;
+    mp_mutex cookie_lock;
+    bool cookies_loaded;
+};
+
+static void floe_cookie_lock(CURL *curl, curl_lock_data data,
+                             curl_lock_access access, void *arg)
 {
-    return mp_get_config_group(ctx, s->global, &mp_network_conf);
+    struct floe_cache_curl_session *session = arg;
+    mp_mutex_lock(&session->cookie_lock);
 }
 
-bool stream_curl_floe_cache_allowed(struct mp_network_opts *network)
+static void floe_cookie_unlock(CURL *curl, curl_lock_data data, void *arg)
 {
-    if (!network) return false;
+    struct floe_cache_curl_session *session = arg;
+    mp_mutex_unlock(&session->cookie_lock);
+}
+
+static void floe_session_destructor(void *arg)
+{
+    struct floe_cache_curl_session *session = arg;
+    if (session->cookies) curl_share_cleanup(session->cookies);
+    mp_mutex_destroy(&session->cookie_lock);
+}
+
+struct floe_cache_curl_session *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s)
+{
+    if (!s->global || !s->global->curl) return NULL;
+    struct floe_cache_curl_session *session = talloc_zero(ctx, struct floe_cache_curl_session);
+    session->network = mp_get_config_group(session, s->global, &mp_network_conf);
+    session->options = mp_get_config_group(session, s->global, &curl_conf);
+    mp_mutex_init(&session->cookie_lock);
+    talloc_set_destructor(session, floe_session_destructor);
+    if (session->network->cookies_enabled) {
+        session->cookies = curl_share_init();
+        if (!session->cookies ||
+            curl_share_setopt(session->cookies, CURLSHOPT_LOCKFUNC, floe_cookie_lock) != CURLSHE_OK ||
+            curl_share_setopt(session->cookies, CURLSHOPT_UNLOCKFUNC, floe_cookie_unlock) != CURLSHE_OK ||
+            curl_share_setopt(session->cookies, CURLSHOPT_USERDATA, session) != CURLSHE_OK ||
+            curl_share_setopt(session->cookies, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE) != CURLSHE_OK) {
+            talloc_free(session);
+            return NULL;
+        }
+    }
+    return session;
+}
+
+bool stream_curl_floe_cache_allowed(struct floe_cache_curl_session *session)
+{
+    if (!session || !session->options->enabled) return false;
+    struct mp_network_opts *network = session->network;
     for (int i = 0; network->http_header_fields && network->http_header_fields[i]; i++) {
         bstr name = bstr_strip(bstr_split(bstr0(network->http_header_fields[i]), ":", NULL));
         if (!bstrcasecmp0(name, "Range") || !bstrcasecmp0(name, "If-Range") ||
@@ -1400,6 +1446,8 @@ static size_t floe_header_callback(char *buffer, size_t size, size_t count, void
 {
     struct floe_curl_stream *cache = arg;
     struct priv *p = &cache->curl;
+    if (cache->passthrough)
+        return header_callback(buffer, size, count, p);
     size_t bytes = size * count;
     bstr line = bstr_strip_linebreaks((bstr){buffer, bytes});
     bool reject = false;
@@ -1428,6 +1476,8 @@ static size_t floe_header_callback(char *buffer, size_t size, size_t count, void
             } else if (response.cacheable) {
                 if (response.start != p->request_start) reject = true;
                 else cache->expected = response;
+            } else if (is_http_success(status)) {
+                cache->passthrough = true;
             }
             if (!reject && !floe_add_conditional(cache)) reject = true;
             mp_mutex_lock(&p->mtx);
@@ -1454,12 +1504,12 @@ static int floe_curl_control(struct stream *s, int command, void *arg)
 }
 
 int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t end,
-    struct mp_network_opts *network, const struct floe_cache_http_response *expected,
+    struct floe_cache_curl_session *session, const struct floe_cache_http_response *expected,
     struct stream **out, struct floe_cache_http_response *response)
 {
     *out = NULL;
     *response = (struct floe_cache_http_response){0};
-    if (!parent->global || !parent->global->curl || !network) return STREAM_ERROR;
+    if (!parent->global || !parent->global->curl || !session) return STREAM_ERROR;
     struct stream *s = talloc_zero(NULL, struct stream);
     s->info = &stream_info_curl;
     s->global = parent->global;
@@ -1474,8 +1524,11 @@ int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t en
     struct priv *p = &cache->curl;
     s->priv = p;
     p->s = s; p->log = s->log; p->global = s->global; p->ctx = s->global->curl;
-    p->opts = mp_get_config_group(p, s->global, &curl_conf);
-    p->net_opts = network;
+    p->opts = session->options;
+    p->net_opts = talloc_memdup(p, session->network, sizeof(*p->net_opts));
+    // Load the initial cookie file once. Cookies learned from redirects or
+    // playback responses remain shared by every subsequent missing range.
+    if (session->cookies_loaded) p->net_opts->cookies_file = NULL;
     p->url = talloc_strdup(p, s->url);
     p->scheme = curl_scheme_lookup(bstr0(p->url));
     p->content_size = -1;
@@ -1490,10 +1543,12 @@ int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t en
     if (expected) cache->expected = *expected;
     p->curl = curl_easy_init();
     if (!p->curl || !stream_init_buffer(s)) { free_stream(s); return STREAM_ERROR; }
+    if (session->cookies)
+        curl_easy_setopt(p->curl, CURLOPT_SHARE, session->cookies);
     setup_curl(p);
-    curl_easy_setopt(p->curl, CURLOPT_ACCEPT_ENCODING, "identity");
-    if (!network->http_proxy || !network->http_proxy[0])
-        curl_easy_setopt(p->curl, CURLOPT_PROXY, "");
+    session->cookies_loaded = true;
+    if (expected && expected->cacheable)
+        curl_easy_setopt(p->curl, CURLOPT_ACCEPT_ENCODING, "identity");
     curl_easy_setopt(p->curl, CURLOPT_HEADERFUNCTION, floe_header_callback);
     curl_easy_setopt(p->curl, CURLOPT_HEADERDATA, cache);
     if (!floe_add_conditional(cache)) { free_stream(s); return STREAM_ERROR; }

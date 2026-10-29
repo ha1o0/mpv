@@ -16,14 +16,20 @@
 #include "misc/hash.h"
 #include "misc/path_utils.h"
 #include "osdep/io.h"
+#include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "stream/stream.h"
 #include "stream/stream_floe_cache.h"
+#include "stream/floe_cache_file.h"
+#ifndef _WIN32
+#include <sys/file.h>
+#endif
 
 struct input {
     int length, opens, status;
     char fill;
     const char *etag, *control, *type;
-    bool offline, ignore_range;
+    bool offline, ignore_range, cache_allowed;
 };
 struct lower {
     struct floe_cache_http_response response;
@@ -35,11 +41,14 @@ static char *base;
 static const char *source = "12345678-1234-1234-1234-123456789abc";
 static const char *url = "https://origin/movie.mp4";
 
-struct mp_network_opts *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s)
+struct floe_cache_curl_session *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s)
 {
     return NULL;
 }
-bool stream_curl_floe_cache_allowed(struct mp_network_opts *network) { return true; }
+bool stream_curl_floe_cache_allowed(struct floe_cache_curl_session *session)
+{
+    return input.cache_allowed;
+}
 
 void free_stream(struct stream *s)
 {
@@ -70,8 +79,13 @@ int stream_read_partial(struct stream *s, void *buffer, int maximum)
     s->pos += count;
     return count;
 }
+bool stream_seek(struct stream *s, int64_t position)
+{
+    s->pos = position;
+    return 1;
+}
 int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t end,
-    struct mp_network_opts *network, const struct floe_cache_http_response *expected,
+    struct floe_cache_curl_session *session, const struct floe_cache_http_response *expected,
     struct stream **out, struct floe_cache_http_response *response)
 {
     input.opens++;
@@ -103,7 +117,7 @@ int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t en
 static void reset_input(void)
 {
     input = (struct input){.length = 128 * 1024, .fill = 'A',
-        .etag = "\"v1\"", .type = "video/mp4", .status = 206};
+        .etag = "\"v1\"", .type = "video/mp4", .status = 206, .cache_allowed = true};
 }
 static char *key_for(const char *name)
 {
@@ -172,7 +186,7 @@ static int64_t data_size(const char *directory)
         if (entry->d_name[0] == '.') continue;
         char *path = mp_path_join(NULL, directory, entry->d_name);
         struct stat st;
-        assert(lstat(path, &st) == 0);
+        assert(floe_cache_lstat(path, &st) == 0);
         if (S_ISDIR(st.st_mode)) size += data_size(path);
         else if (S_ISREG(st.st_mode)) size += st.st_size;
         talloc_free(path);
@@ -206,6 +220,49 @@ static void seed(const char *root, const char *key, int count)
     free_stream(s);
 }
 
+static void test_bypass(void)
+{
+    char *root = mp_path_join(NULL, base, "bypass"), *key = key_for("movie");
+    for (int variant = 0; variant < 15; variant++) {
+        reset_input();
+        struct stream *s = talloc_zero(NULL, struct stream);
+        s->url = talloc_strdup(s, url);
+        s->priv = &input;
+        s->pos = 42;
+        struct stream_open_args args = {.url = s->url};
+        struct floe_cache_stream_options options = {
+            .enabled = true, .directory = root, .key = key, .url = s->url,
+            .source = source, .max_bytes = 1024 * 1024,
+        };
+        if (variant == 1) options.enabled = false;
+        if (variant == 2) options.directory = NULL;
+        if (variant == 3) options.directory = "";
+        if (variant == 4) options.max_bytes = 0;
+        if (variant == 5) options.key = "invalid";
+        if (variant == 6) options.url = NULL;
+        if (variant == 7) options.url = "https://origin/other.mp4";
+        if (variant == 8) args.no_floe_cache = true;
+        if (variant == 9) args.special_arg = s;
+        if (variant == 10) args.flags |= STREAM_LOCAL_FS_ONLY;
+        if (variant == 11) s->mode = STREAM_WRITE;
+        if (variant == 12) {
+            talloc_free(s->url);
+            args.url = options.url = s->url = talloc_strdup(s, "file:///movie.mp4");
+        }
+        if (variant == 13) options.source = "../foreign";
+        if (variant == 14) input.cache_allowed = false;
+        uint8_t original[sizeof(*s)];
+        memcpy(original, s, sizeof(original));
+        assert(stream_floe_cache_open(s, &args, variant == 0 ? NULL : &options) == STREAM_NO_MATCH);
+        assert(!memcmp(original, s, sizeof(original)));
+        assert(input.opens == 0);
+        assert(floe_cache_path_missing(root));
+        free_stream(s);
+    }
+    talloc_free(key); talloc_free(root);
+    puts("disabled, excluded and unavailable transports leave the stream and disk untouched");
+}
+
 static void test_offline_and_related(void)
 {
     reset_input();
@@ -226,6 +283,40 @@ static void test_offline_and_related(void)
     assert(!s->floe_cache);
     free_stream(s); talloc_free(key); talloc_free(root);
     puts("offline reopen/seek and related HTTP stream isolation passed");
+}
+
+static MP_THREAD_VOID release_guard(void *arg)
+{
+    mp_sleep_ns(10 * 1000 * 1000);
+    assert(close(*(int *)arg) == 0);
+    MP_THREAD_RETURN();
+}
+
+static void test_lock_contention(void)
+{
+    reset_input();
+    char *root = mp_path_join(NULL, base, "contention"), *key = key_for("movie");
+    struct stream *s = open_cache(root, key, 1024 * 1024);
+    char *path = mp_path_join(NULL, root, ".lock-v2");
+    int fd = open(path, O_RDWR | O_BINARY); assert(fd >= 0);
+#ifdef _WIN32
+    OVERLAPPED position = {0};
+    assert(LockFileEx((HANDLE)_get_osfhandle(fd), LOCKFILE_EXCLUSIVE_LOCK |
+        LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &position));
+#else
+    assert(flock(fd, LOCK_EX | LOCK_NB) == 0);
+#endif
+    mp_thread thread;
+    assert(mp_thread_create(&thread, release_guard, &fd) == 0);
+    assert(read_cache(s, 0, input.length, 'A') == input.length);
+    assert(mp_thread_join(thread) == 0);
+    free_stream(s);
+    input.offline = true; input.opens = 0;
+    s = open_cache(root, key, 1024 * 1024);
+    assert(read_cache(s, 0, input.length, 'A') == input.length);
+    assert(input.opens == 0); free_stream(s);
+    talloc_free(path); talloc_free(root); talloc_free(key);
+    puts("short management lock contention preserves publication and offline hits");
 }
 
 static void test_changes(void)
@@ -328,6 +419,8 @@ static void test_uncacheable(void)
         int opens = input.opens;
         assert(read_cache(s, input.length, 8192, 'A') == 0);
         assert(input.opens == opens);
+        assert(read_cache(s, 16384, 8192, 'A') == 8192);
+        assert(input.opens == opens);
         free_stream(s); assert(data_size(root) == 0);
         talloc_free(name); talloc_free(root); talloc_free(key);
     }
@@ -353,8 +446,48 @@ static void test_initial_200(void)
     puts("200 initial response records exact length and does not request past EOF");
 }
 
+static void test_file_paths(void)
+{
+    reset_input();
+    char *root = mp_path_join(NULL, base, "\xE6\x96\x87\xE4\xBB\xB6\xE7\xBC\x93\xE5\xAD\x98");
+    char *key = key_for("unicode-path");
+    seed(root, key, input.length);
+    char *chunk = chunk_file(root, key); assert(chunk);
+    struct stat st;
+    assert(floe_cache_lstat(chunk, &st) == 0 && S_ISREG(st.st_mode));
+    assert(st.st_size == input.length);
+    assert(floe_cache_touch(chunk) == 0);
+    assert(!floe_cache_path_missing(chunk));
+    char *missing = mp_path_join(NULL, root, "missing");
+    assert(floe_cache_path_missing(missing));
+    char *link = mp_path_join(NULL, root, "link.chunk");
+    bool created = false;
+#ifdef _WIN32
+    wchar_t *wide_link = mp_from_utf8(NULL, link);
+    wchar_t *wide_target = mp_from_utf8(NULL, chunk);
+    created = CreateSymbolicLinkW(wide_link, wide_target, 0x2) != 0;
+    talloc_free(wide_link); talloc_free(wide_target);
+#else
+    created = symlink(chunk, link) == 0;
+#endif
+    if (created) {
+        assert(floe_cache_lstat(link, &st) == 0);
+        assert(!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode));
+        assert(!floe_cache_path_missing(link));
+        assert(unlink(link) == 0);
+    }
+    input.offline = true; input.opens = 0;
+    struct stream *s = open_cache(root, key, 1024 * 1024);
+    assert(read_cache(s, 0, input.length, 'A') == input.length);
+    assert(input.opens == 0); free_stream(s);
+    talloc_free(link); talloc_free(missing); talloc_free(chunk);
+    talloc_free(root); talloc_free(key);
+    puts("UTF-8 cache paths and no-follow file metadata passed");
+}
+
 int main(int argc, char **argv)
 {
+    mp_time_init();
     if (argc == 6 && !strcmp(argv[1], "--offline-read")) {
         reset_input(); source = argv[3]; input.offline = true;
         int length = atoi(argv[5]);
@@ -384,12 +517,15 @@ int main(int argc, char **argv)
     assert(argc == 2);
     base = talloc_asprintf(NULL, "%s/floe-cache-tests-%ld", argv[1], (long)getpid());
     mp_mkdirp(base);
+    test_bypass();
     test_offline_and_related();
+    test_lock_contention();
     test_changes();
     test_corruption();
     test_quota_and_clear();
     test_uncacheable();
     test_initial_200();
+    test_file_paths();
     talloc_free(base);
     puts("all Floe native cache regressions passed");
     return 0;

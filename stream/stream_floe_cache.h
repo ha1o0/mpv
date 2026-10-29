@@ -14,7 +14,7 @@
 struct mpv_node;
 struct stream;
 struct stream_open_args;
-struct mp_network_opts;
+struct floe_cache_curl_session;
 
 #define FLOE_CACHE_CHUNK_SIZE (4 * 1024 * 1024)
 
@@ -54,10 +54,11 @@ bool stream_floe_cache_validate_http(const struct floe_cache_http_response *out,
 // Reuses the curl transport's auth, proxy and retry policy. Every response,
 // including reconnects, is checked before its body can enter the byte cache.
 int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t end,
-    struct mp_network_opts *network, const struct floe_cache_http_response *expected, struct stream **stream,
+    struct floe_cache_curl_session *session,
+    const struct floe_cache_http_response *expected, struct stream **stream,
     struct floe_cache_http_response *response);
-struct mp_network_opts *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s);
-bool stream_curl_floe_cache_allowed(struct mp_network_opts *network);
+struct floe_cache_curl_session *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s);
+bool stream_curl_floe_cache_allowed(struct floe_cache_curl_session *session);
 
 bool stream_floe_cache_get_state(struct stream *s, struct mpv_node *node);
 

@@ -175,6 +175,15 @@ if get_option('libmpv')
             test('libmpv-mkv-startup', python,
                  args: [files('mkv_startup.py'), '--libmpv', mpvlib.full_path()],
                  depends: mpvlib, timeout: 300, suite: 'libmpv')
+            if features['libcurl']
+                cache_ffmpeg = find_program('ffmpeg', required: false)
+                if cache_ffmpeg.found()
+                    test('libmpv-floe-cache-http', python,
+                         args: [files('floe_cache_http.py'), '--library', mpvlib.full_path(),
+                                '--ffmpeg', cache_ffmpeg.full_path(), '--output-dir', outdir],
+                         depends: mpvlib, timeout: 120, suite: 'libmpv')
+                endif
+            endif
         endif
     endif
 endif

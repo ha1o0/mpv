@@ -19,11 +19,14 @@
 #include "misc/json.h"
 #include "misc/node.h"
 #include "misc/path_utils.h"
+#include "misc/thread_tools.h"
 #include "mpv/client.h"
 #include "osdep/io.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "stream/stream.h"
 #include "stream/stream_floe_cache.h"
+#include "stream/floe_cache_file.h"
 
 #if HAVE_WIN32_DESKTOP
 #include <windows.h>
@@ -34,6 +37,7 @@
 #endif
 
 struct cache_lock { int guard, legacy; };
+enum cache_write_result { CACHE_WRITE_OK, CACHE_WRITE_BUSY, CACHE_WRITE_DISABLED };
 struct cache_file {
     char *path;
     int64_t size, modified;
@@ -45,7 +49,7 @@ struct cache_chunk {
 };
 struct floe_cache_stream {
     struct stream *stream, *lower;
-    struct mp_network_opts *network;
+    struct floe_cache_curl_session *http;
     char *root, *source_dir, *directory, *key, *source;
     int64_t max_bytes, lower_end, pending_start, known_length;
     struct floe_cache_http_response metadata;
@@ -183,14 +187,14 @@ static void sha256(char out[65], const void *data, size_t size)
 static bool directory_exists(const char *path, bool create)
 {
     struct stat st;
-    if (lstat(path, &st) == 0) return S_ISDIR(st.st_mode);
+    if (floe_cache_lstat(path, &st) == 0) return S_ISDIR(st.st_mode);
     return create && errno == ENOENT && mkdir(path, 0700) == 0;
 }
 
 static char *read_file(void *ctx, const char *path, int maximum, int *length)
 {
     struct stat st;
-    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+    if (floe_cache_lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
         st.st_size > maximum) return NULL;
     int fd = open(path, O_RDONLY | O_BINARY);
     if (fd < 0) return NULL;
@@ -213,7 +217,7 @@ static bool write_atomic(const char *path, const void *data, int size)
 {
     char *pending = talloc_asprintf(NULL, "%s.pending", path);
     struct stat st;
-    bool regular = lstat(pending, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
+    bool regular = floe_cache_lstat(pending, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
     int fd = regular ? open(pending, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600) : -1;
     bool ok = fd >= 0;
     for (int offset = 0; ok && offset < size;) {
@@ -240,13 +244,17 @@ static bool lock_descriptor(int fd, bool primary)
 {
 #if HAVE_WIN32_DESKTOP
     OVERLAPPED position = {0};
-    return LockFileEx((HANDLE)_get_osfhandle(fd),
+    bool ok = LockFileEx((HANDLE)_get_osfhandle(fd),
         LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
         0, MAXDWORD, MAXDWORD, &position);
+    if (!ok) errno = GetLastError() == ERROR_LOCK_VIOLATION ? EAGAIN : EIO;
+    return ok;
 #else
     if (primary) return flock(fd, LOCK_EX | LOCK_NB) == 0;
     struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
-    return fcntl(fd, F_SETLK, &lock) == 0;
+    bool ok = fcntl(fd, F_SETLK, &lock) == 0;
+    if (!ok && errno == EACCES) errno = EAGAIN;
+    return ok;
 #endif
 }
 
@@ -269,24 +277,56 @@ static void unlock_descriptor(int fd, bool primary)
 static bool root_lock(struct floe_cache_stream *cache, struct cache_lock *lock)
 {
     *lock = (struct cache_lock){.guard = -1, .legacy = -1};
-    if (mp_mutex_trylock(&floe_cache_lock) != 0) return false;
+    if (mp_mutex_trylock(&floe_cache_lock) != 0) {
+        errno = EAGAIN;
+        return false;
+    }
     void *ctx = talloc_new(NULL);
     char *guard = mp_path_join(ctx, cache->root, ".lock-v2");
     char *legacy = mp_path_join(ctx, cache->root, ".lock");
     struct stat st;
-    bool safe = lstat(guard, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
-    if (safe) lock->guard = open(guard, O_RDWR | O_CREAT | O_BINARY, 0600);
+    int error;
+    bool safe = floe_cache_lstat(guard, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
+    if (!safe) { errno = EINVAL; goto failed; }
+    lock->guard = open(guard, O_RDWR | O_CREAT | O_BINARY, 0600);
     if (lock->guard < 0 || !lock_descriptor(lock->guard, true)) goto failed;
-    safe = lstat(legacy, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
-    if (safe) lock->legacy = open(legacy, O_RDWR | O_CREAT | O_BINARY, 0600);
+    safe = floe_cache_lstat(legacy, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
+    if (!safe) { errno = EINVAL; goto failed; }
+    lock->legacy = open(legacy, O_RDWR | O_CREAT | O_BINARY, 0600);
     if (lock->legacy < 0 || !lock_descriptor(lock->legacy, false)) goto failed;
     talloc_free(ctx);
     return true;
 failed:
+    error = errno;
     unlock_descriptor(lock->legacy, false);
     unlock_descriptor(lock->guard, true);
     talloc_free(ctx);
     mp_mutex_unlock(&floe_cache_lock);
+    errno = error;
+    return false;
+}
+
+static bool lock_busy(void)
+{
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+
+static bool root_lock_for_io(struct floe_cache_stream *cache, struct cache_lock *lock)
+{
+    // A status query or short management operation must not revoke a writer
+    // or turn an offline hit into a network miss. Other disk failures fail open
+    // immediately; contention has a 95 ms wait budget and is cancellable.
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (root_lock(cache, lock)) return true;
+        if (!lock_busy() || mp_cancel_test(cache->stream->cancel)) return false;
+        if (attempt == 19) break;
+        if (cache->stream->cancel) {
+            if (mp_cancel_wait(cache->stream->cancel, 0.005)) return false;
+        } else {
+            mp_sleep_ns(5 * 1000 * 1000);
+        }
+    }
+    errno = EAGAIN;
     return false;
 }
 
@@ -304,7 +344,7 @@ static bool epoch(const char *directory, char out[65], bool create)
     char *data = read_file(ctx, path, 64, NULL);
     bool ok = data && hex_string(data, false);
     if (ok) strcpy(out, data);
-    else if (!data && create && access(path, F_OK) != 0 && errno == ENOENT) {
+    else if (!data && create && floe_cache_path_missing(path)) {
         for (int i = 0; i < 8; i++)
             snprintf(out + i * 8, 9, "%08" PRIx32, av_get_random_seed());
         ok = write_atomic(path, out, 64);
@@ -427,7 +467,7 @@ static bool collect_leaf(void *ctx, const char *directory, bool legacy,
         if (!owned_file(item->d_name, legacy)) continue;
         char *path = mp_path_join(ctx, directory, item->d_name);
         struct stat st;
-        if (lstat(path, &st) != 0) {
+        if (floe_cache_lstat(path, &st) != 0) {
             if (errno == ENOENT) continue;
             closedir(dir); return false;
         }
@@ -488,7 +528,7 @@ static int64_t current_quota(struct floe_cache_stream *cache)
     const char *p = data;
     int64_t quota;
     bool ok = data && number(&p, &quota) && !*p;
-    bool missing = access(path, F_OK) != 0 && errno == ENOENT;
+    bool missing = floe_cache_path_missing(path);
     talloc_free(ctx);
     return ok ? quota : missing ? cache->max_bytes : 0;
 }
@@ -550,7 +590,7 @@ static void remove_media(struct floe_cache_stream *cache)
             continue;
         char *path = mp_path_join(NULL, cache->directory, item->d_name);
         struct stat st;
-        if (lstat(path, &st) == 0 && S_ISREG(st.st_mode)) unlink(path);
+        if (floe_cache_lstat(path, &st) == 0 && S_ISREG(st.st_mode)) unlink(path);
         talloc_free(path);
     }
     closedir(dir);
@@ -559,7 +599,7 @@ static void remove_media(struct floe_cache_stream *cache)
 static void invalidate(struct floe_cache_stream *cache)
 {
     struct cache_lock lock;
-    if (root_lock(cache, &lock)) {
+    if (root_lock_for_io(cache, &lock)) {
         if (valid_lease(cache) && current_version(cache)) remove_media(cache);
         root_unlock(&lock);
     }
@@ -571,7 +611,7 @@ static void invalidate(struct floe_cache_stream *cache)
 static bool register_metadata(struct floe_cache_stream *cache)
 {
     struct cache_lock lock;
-    if (!root_lock(cache, &lock)) return false;
+    if (!root_lock_for_io(cache, &lock)) return false;
     bool ok = valid_lease(cache);
     struct floe_cache_http_response existing;
     if (ok && load_metadata(cache, &existing)) {
@@ -604,37 +644,41 @@ static bool register_metadata(struct floe_cache_stream *cache)
     return ok;
 }
 
-static bool write_chunk(struct floe_cache_stream *cache, int64_t start,
-                         const uint8_t *data, int size)
+static enum cache_write_result write_chunk(struct floe_cache_stream *cache,
+                                          int64_t start, const uint8_t *data, int size)
 {
     if (size <= 0 || size > FLOE_CACHE_CHUNK_SIZE || start < 0 ||
-        start > cache->metadata.length - size) return false;
+        start > cache->metadata.length - size) return CACHE_WRITE_DISABLED;
     char checksum[65]; sha256(checksum, data, size);
     struct cache_lock lock;
-    if (!root_lock(cache, &lock)) return false;
+    if (!root_lock_for_io(cache, &lock))
+        return lock_busy() ? CACHE_WRITE_BUSY : CACHE_WRITE_DISABLED;
     void *ctx = talloc_new(NULL);
     char *path = talloc_asprintf(ctx, "%s/%s.%s.%" PRId64 ".%d.%s.chunk",
         cache->directory, cache->key, cache->version, start, size, checksum);
     char *meta = metadata_path(ctx, cache);
     bool ok = valid_lease(cache) && current_version(cache);
     struct stat st;
-    if (ok && lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == size) {
-        root_unlock(&lock); talloc_free(ctx); return true;
+    if (ok && floe_cache_lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == size) {
+        root_unlock(&lock); talloc_free(ctx); return CACHE_WRITE_OK;
     }
     ok = ok && directory_exists(cache->directory, false) && make_room(cache, size, meta);
     if (ok) {
         ok = write_atomic(path, data, size);
-        if (ok) utime(meta, NULL);
+        if (ok) floe_cache_touch(meta);
     }
     talloc_free(ctx); root_unlock(&lock);
-    return ok;
+    return ok ? CACHE_WRITE_OK : CACHE_WRITE_DISABLED;
 }
 
 static void flush_pending(struct floe_cache_stream *cache)
 {
-    if (cache->publish && cache->pending_length)
-        cache->publish = write_chunk(cache, cache->pending_start,
-                                      cache->pending, cache->pending_length);
+    // An extended lock conflict can skip this optional fragment while later
+    // fragments still publish. I/O errors and a revoked lease stop publication.
+    if (cache->publish && cache->pending_length &&
+        write_chunk(cache, cache->pending_start, cache->pending, cache->pending_length)
+            == CACHE_WRITE_DISABLED)
+        cache->publish = false;
     cache->pending_length = 0;
 }
 
@@ -662,12 +706,12 @@ static int read_cached(struct floe_cache_stream *cache, int64_t position,
 {
     if (!cache->metadata.cacheable) return 0;
     struct cache_lock lock;
-    if (!root_lock(cache, &lock)) return 0;
+    if (!root_lock_for_io(cache, &lock)) return 0;
     if (!current_version(cache)) { root_unlock(&lock); return 0; }
     struct stat st;
     bool in_memory = cache->read_path && cache->read_start <= position &&
         position < cache->read_start + cache->read_length &&
-        lstat(cache->read_path, &st) == 0 && S_ISREG(st.st_mode) &&
+        floe_cache_lstat(cache->read_path, &st) == 0 && S_ISREG(st.st_mode) &&
         st.st_size == cache->read_length;
     if (!in_memory) {
         DIR *dir = opendir(cache->directory);
@@ -683,7 +727,7 @@ static int read_cached(struct floe_cache_stream *cache, int64_t position,
             if (!path || chunk.start + chunk.length > chosen.start + chosen.length) {
                 char *candidate = mp_path_join(NULL, cache->directory, item->d_name);
                 struct stat candidate_stat;
-                if (lstat(candidate, &candidate_stat) != 0 || !S_ISREG(candidate_stat.st_mode)) {
+                if (floe_cache_lstat(candidate, &candidate_stat) != 0 || !S_ISREG(candidate_stat.st_mode)) {
                     talloc_free(candidate); continue;
                 }
                 talloc_free(path);
@@ -712,11 +756,11 @@ static int read_cached(struct floe_cache_stream *cache, int64_t position,
     int amount = MPMIN((int64_t)maximum,
         cache->read_start + cache->read_length - position);
     memcpy(buffer, cache->read_buffer + position - cache->read_start, amount);
-    if (valid_lease(cache) && lstat(cache->read_path, &st) == 0 &&
+    if (valid_lease(cache) && floe_cache_lstat(cache->read_path, &st) == 0 &&
         time(NULL) - st.st_mtime >= 30) {
-        utime(cache->read_path, NULL);
+        floe_cache_touch(cache->read_path);
         char *meta = metadata_path(NULL, cache);
-        utime(meta, NULL); talloc_free(meta);
+        floe_cache_touch(meta); talloc_free(meta);
     }
     root_unlock(&lock);
     return amount;
@@ -726,7 +770,7 @@ static int64_t next_cached_start(struct floe_cache_stream *cache, int64_t positi
 {
     int64_t end = cache->metadata.length > 0 ? cache->metadata.length : 0;
     struct cache_lock lock;
-    if (!cache->metadata.cacheable || !root_lock(cache, &lock)) return end;
+    if (!cache->metadata.cacheable || !root_lock_for_io(cache, &lock)) return end;
     DIR *dir = opendir(cache->directory);
     if (dir) {
         struct dirent *item;
@@ -759,7 +803,7 @@ static bool open_lower(struct floe_cache_stream *cache, int64_t position,
         cache->metadata.cacheable ? &cache->metadata : NULL;
     int64_t end = expected ? next_cached_start(cache, position) : 0;
     int result = stream_curl_floe_cache_open(cache->stream, position, end,
-        cache->network, expected, &cache->lower, &response);
+        cache->http, expected, &cache->lower, &response);
     if (response.changed) { invalidate(cache); close_lower(cache); return false; }
     if (result != STREAM_OK) return false;
     if (expected && !stream_floe_cache_validate_http(&response, expected, position, end)) {
@@ -793,6 +837,10 @@ static int cache_fill_buffer(struct stream *s, void *buffer, int maximum)
 {
     struct floe_cache_stream *cache = s->floe_cache;
     if (cache->failed || maximum <= 0) return 0;
+    // Uncacheable streams retain the ordinary reader's request continuation,
+    // decompression, metadata and cookies for their entire lifetime.
+    if (!cache->metadata.cacheable)
+        return cache->lower ? stream_read_partial(cache->lower, buffer, maximum) : 0;
     int64_t position = s->pos;
     if (cache->known_length >= 0 && position >= cache->known_length) {
         close_lower(cache); return 0;
@@ -815,6 +863,8 @@ static int cache_fill_buffer(struct stream *s, void *buffer, int maximum)
 static int cache_seek(struct stream *s, int64_t position)
 {
     struct floe_cache_stream *cache = s->floe_cache;
+    if (!cache->metadata.cacheable)
+        return cache->lower && stream_seek(cache->lower, position);
     if (cache->failed || position < 0 ||
         (cache->metadata.length > 0 && position > cache->metadata.length)) return 0;
     // Cached ranges and the resource size need no network operation. Open the
@@ -826,6 +876,8 @@ static int cache_seek(struct stream *s, int64_t position)
 static int64_t cache_get_size(struct stream *s)
 {
     struct floe_cache_stream *cache = s->floe_cache;
+    if (!cache->metadata.cacheable)
+        return cache->lower ? stream_get_size(cache->lower) : -1;
     if (cache->known_length >= 0) return cache->known_length;
     return cache->lower ? stream_get_size(cache->lower) : cache->metadata.length;
 }
@@ -858,6 +910,7 @@ int stream_floe_cache_open(struct stream *s, struct stream_open_args *args,
         !options->directory || !options->directory[0] || options->max_bytes <= 0 ||
         !hex_string(options->key, false) || !options->url ||
         strcmp(options->url, s->url) || args->no_floe_cache || args->special_arg ||
+        (args->flags & STREAM_LOCAL_FS_ONLY) ||
         s->mode != STREAM_READ ||
         (strncmp(s->url, "http://", 7) && strncmp(s->url, "https://", 8)))
         return STREAM_NO_MATCH;
@@ -873,21 +926,21 @@ int stream_floe_cache_open(struct stream *s, struct stream_open_args *args,
     cache->max_bytes = options->max_bytes;
     cache->known_length = -1;
 #if HAVE_LIBCURL
-    cache->network = stream_curl_floe_cache_snapshot(cache, s);
-    if (!stream_curl_floe_cache_allowed(cache->network)) {
+    cache->http = stream_curl_floe_cache_snapshot(cache, s);
+    if (!stream_curl_floe_cache_allowed(cache->http)) {
         talloc_free(cache); return STREAM_NO_MATCH;
     }
 #endif
     mp_mkdirp(cache->root);
     struct cache_lock lock;
-    if (!directory_exists(cache->root, false) || !root_lock(cache, &lock)) {
+    if (!directory_exists(cache->root, false) || !root_lock_for_io(cache, &lock)) {
         talloc_free(cache); return STREAM_NO_MATCH;
     }
     bool ready = directory_exists(cache->source_dir, true) &&
         epoch(cache->root, cache->root_epoch, true) &&
         epoch(cache->source_dir, cache->source_epoch, true);
     char *quota_path = mp_path_join(NULL, cache->root, ".quota");
-    if (ready && access(quota_path, F_OK) != 0 && errno == ENOENT) {
+    if (ready && floe_cache_path_missing(quota_path)) {
         char value[32];
         int size = snprintf(value, sizeof(value), "%" PRId64, cache->max_bytes);
         ready = write_atomic(quota_path, value, size);
@@ -946,7 +999,7 @@ bool stream_floe_cache_get_state(struct stream *s, struct mpv_node *node)
                 chunk.start + chunk.length > cache->metadata.length) continue;
             char *path = mp_path_join(NULL, cache->directory, item->d_name);
             struct stat st;
-            bool valid = lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == chunk.length;
+            bool valid = floe_cache_lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == chunk.length;
             talloc_free(path);
             if (!valid || size > INT64_MAX - chunk.length) continue;
             struct mpv_node *range = node_array_add(ranges, MPV_FORMAT_NODE_MAP);
