@@ -1639,6 +1639,12 @@ static int mp_property_demuxer_cache_state(void *ctx, struct m_property *prop,
     return M_PROPERTY_OK;
 }
 
+static int mp_property_floe_cache_version(void *ctx, struct m_property *prop,
+                                        int action, void *arg)
+{
+    return m_property_int_ro(action, arg, stream_floe_cache_version());
+}
+
 static int mp_property_floe_cache_state(void *ctx, struct m_property *prop,
                                         int action, void *arg)
 {
@@ -4680,6 +4686,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-start-time", mp_property_demuxer_start_time},
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
     {"floe-cache-state", mp_property_floe_cache_state},
+    {"floe-cache-version", mp_property_floe_cache_version},
     {"cache-buffering-state", mp_property_cache_buffering},
     {"paused-for-cache", mp_property_paused_for_cache},
     {"demuxer-via-network", mp_property_demuxer_is_network},

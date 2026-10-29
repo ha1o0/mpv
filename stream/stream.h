@@ -88,6 +88,7 @@ enum stream_ctrl {
     STREAM_CTRL_GET_NUM_ANGLES,
     STREAM_CTRL_GET_ANGLE,
     STREAM_CTRL_SET_ANGLE,
+    STREAM_CTRL_GET_FLOE_HTTP_RESPONSE,
     STREAM_CTRL_GET_NUM_TITLES,
     STREAM_CTRL_GET_TITLE_LENGTH,    // double* (in: title number, out: len)
     STREAM_CTRL_GET_TITLE_PLAYLIST,  // double* (in: title number, out: playlist)
@@ -233,6 +234,7 @@ int stream_peek(stream_t *s, int forward_size);
 int stream_read_peek(stream_t *s, void *buf, int buf_size);
 void stream_drop_buffers(stream_t *s);
 int64_t stream_get_size(stream_t *s);
+bool stream_init_buffer(stream_t *s);
 
 struct mpv_global;
 
@@ -254,6 +256,7 @@ struct stream_open_args {
     int flags;                  // STREAM_READ etc.
     const stream_info_t *sinfo; // NULL = autoprobe, otherwise force stream impl.
     void *special_arg;          // specific to impl., use only with sinfo
+    bool no_floe_cache;         // internal lower stream of the byte cache
 };
 
 int stream_create_with_args(struct stream_open_args *args, struct stream **ret);

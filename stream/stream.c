@@ -112,6 +112,8 @@ struct stream_opts {
     bool floe_cache_enabled;
     char *floe_cache_dir;
     char *floe_cache_key;
+    char *floe_cache_url;
+    char *floe_cache_source;
     int64_t floe_cache_max_bytes;
 };
 
@@ -125,6 +127,8 @@ const struct m_sub_options stream_conf = {
         {"floe-cache-enabled", OPT_BOOL(floe_cache_enabled)},
         {"floe-cache-dir", OPT_STRING(floe_cache_dir), .flags = M_OPT_FILE},
         {"floe-cache-key", OPT_STRING(floe_cache_key)},
+        {"floe-cache-url", OPT_STRING(floe_cache_url)},
+        {"floe-cache-source", OPT_STRING(floe_cache_source)},
         {"floe-cache-max-bytes", OPT_BYTE_SIZE(floe_cache_max_bytes),
             M_RANGE(0, INT64_MAX)},
         {0}
@@ -332,6 +336,11 @@ static bool stream_resize_buffer(struct stream *s, int keep, int new)
     return true;
 }
 
+bool stream_init_buffer(struct stream *s)
+{
+    return stream_resize_buffer(s, 0, 0);
+}
+
 static int stream_create_instance(const stream_info_t *sinfo,
                                   struct stream_open_args *args,
                                   struct stream **ret)
@@ -411,10 +420,20 @@ static int stream_create_instance(const stream_info_t *sinfo,
         return STREAM_UNSAFE;
     }
 
-    int r = STREAM_UNSUPPORTED;
-    if (sinfo->open2) {
+    struct floe_cache_stream_options floe_cache_options = {
+        .enabled = opts->floe_cache_enabled,
+        .directory = opts->floe_cache_dir,
+        .key = opts->floe_cache_key,
+        .url = opts->floe_cache_url,
+        .source = opts->floe_cache_source,
+        .max_bytes = opts->floe_cache_max_bytes,
+    };
+    // Cache metadata can open an offline stream before the network backend.
+    // The pinned URL prevents options from leaking into related HTTP streams.
+    int r = stream_floe_cache_open(s, args, &floe_cache_options);
+    if (r == STREAM_NO_MATCH && sinfo->open2) {
         r = sinfo->open2(s, args);
-    } else if (!args->special_arg) {
+    } else if (r == STREAM_NO_MATCH && !args->special_arg) {
         r = (sinfo->open)(s);
     }
     if (r != STREAM_OK) {
@@ -422,18 +441,10 @@ static int stream_create_instance(const stream_info_t *sinfo,
         return r;
     }
 
-    if (!stream_resize_buffer(s, 0, 0)) {
+    if (!stream_init_buffer(s)) {
         free_stream(s);
         return STREAM_ERROR;
     }
-
-    struct floe_cache_stream_options floe_cache_options = {
-        .enabled = opts->floe_cache_enabled,
-        .directory = opts->floe_cache_dir,
-        .key = opts->floe_cache_key,
-        .max_bytes = opts->floe_cache_max_bytes,
-    };
-    stream_floe_cache_wrap(s, &floe_cache_options);
 
     mp_assert(s->seekable == !!s->seek);
 

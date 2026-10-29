@@ -19,6 +19,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
 #include <curl/curl.h>
 
@@ -49,6 +50,7 @@
 #include "options/path.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
+#include "stream_floe_cache.h"
 
 enum curl_proto {
     MP_CURL_PROTO_HTTP,
@@ -1321,4 +1323,203 @@ void mp_curl_avio_close(AVIOContext *pb, void *cookie)
         transport = pb;
     }
     close_curl_transport(transport, c);
+}
+
+// Keep cache-specific HTTP validation outside the regular curl reader and its
+// network-policy patches. The existing ring buffer, cancellation, retries and
+// timeout callbacks are reused without changing other HTTP/AVIO consumers.
+struct floe_curl_stream {
+    struct priv curl; // must remain first for the existing callbacks/destructor
+    struct floe_cache_http_response expected, response;
+    bool conditional_added, rejected;
+};
+
+struct mp_network_opts *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s)
+{
+    return mp_get_config_group(ctx, s->global, &mp_network_conf);
+}
+
+bool stream_curl_floe_cache_allowed(struct mp_network_opts *network)
+{
+    if (!network) return false;
+    for (int i = 0; network->http_header_fields && network->http_header_fields[i]; i++) {
+        bstr name = bstr_strip(bstr_split(bstr0(network->http_header_fields[i]), ":", NULL));
+        if (!bstrcasecmp0(name, "Range") || !bstrcasecmp0(name, "If-Range") ||
+            !bstrcasecmp0(name, "If-Match") || !bstrcasecmp0(name, "If-None-Match") ||
+            !bstrcasecmp0(name, "If-Modified-Since") || !bstrcasecmp0(name, "If-Unmodified-Since"))
+            return false;
+    }
+    return true;
+}
+
+static bool floe_add_conditional(struct floe_curl_stream *cache)
+{
+    if (cache->conditional_added || !cache->expected.cacheable) return true;
+    struct priv *p = &cache->curl;
+    char *header = talloc_asprintf(NULL, "If-Range: %s", cache->expected.validator);
+    struct curl_slist *headers = curl_slist_append(p->headers, header);
+    talloc_free(header);
+    if (!headers) return false;
+    // HTTP's existing list includes Icy-MetaData, so appending preserves its
+    // address even after the first response has supplied a strong validator.
+    if (!p->headers) curl_easy_setopt(p->curl, CURLOPT_HTTPHEADER, headers);
+    p->headers = headers;
+    cache->conditional_added = true;
+    return true;
+}
+
+static const char *floe_single_header(CURL *curl, const char *name, bool *valid)
+{
+    struct curl_header *duplicate = NULL;
+    if (curl_easy_header(curl, name, 1, CURLH_HEADER, -1, &duplicate) == CURLHE_OK)
+        *valid = false;
+    return header_value(curl, name);
+}
+
+static int64_t floe_content_length(CURL *curl, bool *valid)
+{
+    const char *header = floe_single_header(curl, "Content-Length", valid);
+    if (header) {
+        char *end;
+        errno = 0;
+        int64_t length = strtoll(header, &end, 10);
+        if (errno || header[0] < '0' || header[0] > '9' || *end || length < 0) {
+            *valid = false;
+            return -1;
+        }
+        return length;
+    }
+    // Some 200 responses have not populated CURLINFO length yet when this
+    // callback runs; the explicit header is authoritative when supplied.
+    curl_off_t length = -1;
+    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length);
+    return length;
+}
+
+static size_t floe_header_callback(char *buffer, size_t size, size_t count, void *arg)
+{
+    struct floe_curl_stream *cache = arg;
+    struct priv *p = &cache->curl;
+    size_t bytes = size * count;
+    bstr line = bstr_strip_linebreaks((bstr){buffer, bytes});
+    bool reject = false;
+    if (!line.len) {
+        long status = 0;
+        curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &status);
+        if (status >= 200 && !(status >= 300 && status < 400)) {
+            bool single = true;
+            int64_t length = floe_content_length(p->curl, &single);
+            struct floe_cache_http_response response;
+            const char *range = floe_single_header(p->curl, "Content-Range", &single);
+            const char *accept = floe_single_header(p->curl, "Accept-Ranges", &single);
+            const char *etag = floe_single_header(p->curl, "ETag", &single);
+            const char *modified = floe_single_header(p->curl, "Last-Modified", &single);
+            const char *type = floe_single_header(p->curl, "Content-Type", &single);
+            const char *encoding = floe_single_header(p->curl, "Content-Encoding", &single);
+            const char *control = floe_single_header(p->curl, "Cache-Control", &single);
+            const char *vary = floe_single_header(p->curl, "Vary", &single);
+            stream_floe_cache_parse_http(&response, status, length, range, accept,
+                etag, modified, type, encoding, control, vary);
+            response.cacheable &= single && !mp_icy_active(p->icy);
+            if (cache->expected.cacheable) {
+                reject = !stream_floe_cache_validate_http(&response,
+                    &cache->expected, p->request_start, p->request_end);
+                response.changed = reject && (status == 200 || status == 206 || status == 416);
+            } else if (response.cacheable) {
+                if (response.start != p->request_start) reject = true;
+                else cache->expected = response;
+            }
+            if (!reject && !floe_add_conditional(cache)) reject = true;
+            mp_mutex_lock(&p->mtx);
+            cache->rejected |= reject;
+            response.changed |= cache->response.changed;
+            cache->response = response;
+            mp_mutex_unlock(&p->mtx);
+        }
+    }
+    // Retain the transport's own status handling and timeout accounting.
+    size_t result = header_callback(buffer, size, count, p);
+    return reject ? 0 : result;
+}
+
+static int floe_curl_control(struct stream *s, int command, void *arg)
+{
+    struct floe_curl_stream *cache = s->priv;
+    if (command != STREAM_CTRL_GET_FLOE_HTTP_RESPONSE)
+        return curl_control(s, command, arg);
+    mp_mutex_lock(&cache->curl.mtx);
+    *(struct floe_cache_http_response *)arg = cache->response;
+    mp_mutex_unlock(&cache->curl.mtx);
+    return STREAM_OK;
+}
+
+int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t end,
+    struct mp_network_opts *network, const struct floe_cache_http_response *expected,
+    struct stream **out, struct floe_cache_http_response *response)
+{
+    *out = NULL;
+    *response = (struct floe_cache_http_response){0};
+    if (!parent->global || !parent->global->curl || !network) return STREAM_ERROR;
+    struct stream *s = talloc_zero(NULL, struct stream);
+    s->info = &stream_info_curl;
+    s->global = parent->global;
+    s->cancel = mp_cancel_new(s);
+    mp_cancel_set_parent(s->cancel, parent->cancel);
+    s->log = mp_log_new(s, parent->log, "floe-range");
+    s->url = talloc_strdup(s, parent->url);
+    s->path = talloc_strdup(s, parent->path);
+    s->stream_origin = parent->stream_origin;
+    s->requested_buffer_size = parent->requested_buffer_size;
+    struct floe_curl_stream *cache = talloc_zero(s, struct floe_curl_stream);
+    struct priv *p = &cache->curl;
+    s->priv = p;
+    p->s = s; p->log = s->log; p->global = s->global; p->ctx = s->global->curl;
+    p->opts = mp_get_config_group(p, s->global, &curl_conf);
+    p->net_opts = network;
+    p->url = talloc_strdup(p, s->url);
+    p->scheme = curl_scheme_lookup(bstr0(p->url));
+    p->content_size = -1;
+    p->request_start = start; p->request_end = end;
+    p->buffer_size = p->opts->buffer_size;
+    p->buffer = talloc_size(p, p->buffer_size);
+    p->icy = mp_icy_new(p);
+    mp_mutex_init(&p->mtx); mp_cond_init(&p->cond);
+    p->aborted = false;
+    talloc_set_destructor(cache, priv_destructor);
+    s->close = curl_close;
+    if (expected) cache->expected = *expected;
+    p->curl = curl_easy_init();
+    if (!p->curl || !stream_init_buffer(s)) { free_stream(s); return STREAM_ERROR; }
+    setup_curl(p);
+    curl_easy_setopt(p->curl, CURLOPT_ACCEPT_ENCODING, "identity");
+    if (!network->http_proxy || !network->http_proxy[0])
+        curl_easy_setopt(p->curl, CURLOPT_PROXY, "");
+    curl_easy_setopt(p->curl, CURLOPT_HEADERFUNCTION, floe_header_callback);
+    curl_easy_setopt(p->curl, CURLOPT_HEADERDATA, cache);
+    if (!floe_add_conditional(cache)) { free_stream(s); return STREAM_ERROR; }
+    mp_cancel_set_cb(s->cancel, on_cancel, p);
+    // Producer request_start may advance before a short response is consumed.
+    s->pos = start;
+    cmd_sync(p, CMD_ADD, 0, false);
+    mp_mutex_lock(&p->mtx);
+    while (!p->probed && !atomic_load_explicit(&p->aborted, memory_order_relaxed))
+        mp_cond_wait(&p->cond, &p->mtx);
+    *response = cache->response;
+    bool rejected = cache->rejected;
+    mp_mutex_unlock(&p->mtx);
+    if (!is_http_success(response->status) || rejected || response->changed || atomic_load(&p->aborted)) {
+        free_stream(s); return STREAM_ERROR;
+    }
+    char *type = NULL;
+    curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &type);
+    bstr mime = bstr_strip(bstr_split(bstr0(type), ";", NULL));
+    if (mime.len) s->mime_type = bstrto0(s, mime);
+    s->seekable = p->seekable;
+    s->is_network = s->streaming = s->fast_skip = true;
+    s->fill_buffer = curl_fill_buffer;
+    s->seek = s->seekable ? curl_seek : NULL;
+    s->get_size = curl_get_size;
+    s->control = floe_curl_control;
+    *out = s;
+    return STREAM_OK;
 }

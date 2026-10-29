@@ -116,6 +116,12 @@ paths = executable('paths', 'paths.c', include_directories: incdir,
 test('paths', paths)
 
 if features['libcurl']
+    floe_cache = executable('floe-cache', files('floe_cache.c'),
+                           include_directories: incdir,
+                           objects: libmpv.extract_objects('stream/stream_floe_cache.c', 'misc/hash.c'),
+                           link_with: test_utils)
+    test('floe-cache', floe_cache, args: outdir)
+
     avio_crypto_objects = libmpv.extract_objects('demux/avio_crypto.c')
     avio_crypto = executable('avio-crypto', files('avio_crypto.c'),
                              include_directories: incdir,
