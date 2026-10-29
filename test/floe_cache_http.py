@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,31 @@ import time
 SOURCE = '12345678-1234-1234-1234-123456789abc'
 CASES = ('ordinary', 'ffmpeg', 'cookie', 'cookie-file', 'no-store-cookie',
          'no-validator-cookie', 'gzip', 'environment-proxy', 'explicit-proxy',
-         'unavailable-disk', 'conditional-header', 'local-file')
+         'unavailable-disk', 'conditional-header', 'local-file', 'long-path')
+
+
+def filesystem_path(path):
+    """Inspect native cache files even when Python's host disables long paths."""
+    if os.name != 'nt':
+        return Path(path)
+    value = os.path.abspath(path).replace('/', '\\')
+    if not value.startswith('\\\\?\\'):
+        value = ('\\\\?\\UNC\\' + value[2:] if value.startswith('\\\\')
+                 else '\\\\?\\' + value)
+    return Path(value)
+
+
+def run_player(library, url, properties, env, pause_for_cache_state=False):
+    child = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                            '--library', str(library), '--child'],
+                           input=json.dumps({'url': url, 'properties': properties,
+                                             'pause_for_cache_state': pause_for_cache_state}),
+                           text=True, capture_output=True, env=env, timeout=20)
+    try:
+        native = json.loads(child.stdout)
+    except ValueError:
+        native = {'stdout': child.stdout, 'stderr': child.stderr}
+    return child.returncode, native
 
 
 class Event(C.Structure):
@@ -72,6 +97,8 @@ def player(library):
         options = {'config': 'no', 'load-scripts': 'no', 'ytdl': 'no',
                    'vo': 'null', 'ao': 'null', 'terminal': 'no', 'untimed': 'yes',
                    'idle': 'yes', 'network-timeout': '2'}
+        if settings.get('pause_for_cache_state'):
+            options['pause'] = 'yes'
         for name, value in options.items():
             code = lib.mpv_set_option_string(handle, name.encode(), value.encode())
             if code == -5 and name in ('load-scripts', 'ytdl'):
@@ -88,12 +115,21 @@ def player(library):
             event = lib.mpv_wait_event(handle, 0.05).contents
             if event.event_id == 8:
                 result['loaded'] = True
-                pointer = lib.mpv_get_property_string(handle, b'floe-cache-state')
+                # The property is deliberately nonblocking. Hold an offline
+                # file open and retry a brief reader-lock conflict.
+                snapshot_deadline = time.monotonic() + (0.5 if settings.get('pause_for_cache_state') else 0)
+                while True:
+                    pointer = lib.mpv_get_property_string(handle, b'floe-cache-state')
+                    if pointer or time.monotonic() >= snapshot_deadline:
+                        break
+                    time.sleep(0.01)
                 if pointer:
                     try:
                         result['cache_state'] = C.string_at(pointer).decode('utf8')
                     finally:
                         lib.mpv_free(pointer)
+                if settings.get('pause_for_cache_state'):
+                    check(lib.mpv_set_property_string(handle, b'pause', b'no'), 'resume')
             elif event.event_id == 2:
                 entry = C.cast(event.data, C.POINTER(Log)).contents
                 result['logs'].append(entry.text.decode('utf8', errors='replace'))
@@ -134,6 +170,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             start = int(left)
             end = min(end, int(right) + 1) if right else end
         status = 206 if range_header else 200
+        if self.server.offline:
+            status = 503
         cookie = self.headers.get('Cookie') or ''
         if self.server.cookie and start and 'floe_test=valid' not in cookie:
             status = 403
@@ -174,6 +212,7 @@ def run_case(library, fixture, scratch, kind, enabled):
     server.daemon_threads = True
     server.payload = fixture.read_bytes()
     server.kind = kind
+    server.offline = False
     server.cookie = kind in ('cookie', 'cookie-file', 'no-store-cookie', 'no-validator-cookie')
     server.records = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -181,6 +220,11 @@ def run_case(library, fixture, scratch, kind, enabled):
            if key.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')}
     url = 'http://127.0.0.1:{}/movie.mp4'.format(server.server_port)
     root = scratch / '{}-{}'.format(kind, enabled)
+    if kind == 'long-path':
+        for _ in range(4):
+            root /= 'long-cache-directory-0123456789012345678901234567890123456789'
+        root /= '\u6587\u4ef6\u7f13\u5b58'
+        filesystem_path(root.parent).mkdir(parents=True)
     if kind == 'unavailable-disk':
         root.write_bytes(b'ordinary file')
     properties = {'curl-enabled': 'no' if kind == 'ffmpeg' else 'yes',
@@ -211,16 +255,10 @@ def run_case(library, fixture, scratch, kind, enabled):
         url = str(fixture)
         properties['floe-cache-url'] = url
     try:
-        child = subprocess.run([sys.executable, str(Path(__file__).resolve()),
-                                '--library', str(library), '--child'],
-                               input=json.dumps({'url': url, 'properties': properties}),
-                               text=True, capture_output=True, env=env, timeout=20)
-        try:
-            native = json.loads(child.stdout)
-        except ValueError:
-            native = {'stdout': child.stdout, 'stderr': child.stderr}
-        chunks = list(root.rglob('*.chunk')) if root.is_dir() else []
-        passed = (child.returncode == 0 and native.get('loaded') and native.get('end_reason') == 0
+        exit_code, native = run_player(library, url, properties, env)
+        cache_files = filesystem_path(root)
+        chunks = list(cache_files.rglob('*.chunk')) if cache_files.is_dir() else []
+        passed = (exit_code == 0 and native.get('loaded') and native.get('end_reason') == 0
                   and all(record['status'] < 400 for record in server.records))
         bypass = not enabled or kind in ('ffmpeg', 'no-store-cookie', 'no-validator-cookie',
                                          'gzip', 'conditional-header', 'local-file', 'unavailable-disk')
@@ -239,9 +277,23 @@ def run_case(library, fixture, scratch, kind, enabled):
             passed = passed and len(data) == length and hashlib.sha256(data).hexdigest() == parts[4]
             passed = passed and data == server.payload[start:start + length]
         if kind == 'unavailable-disk':
-            passed = passed and root.read_bytes() == b'ordinary file'
+            passed = passed and cache_files.read_bytes() == b'ordinary file'
+        offline_native = None
+        if kind == 'long-path' and enabled:
+            request_count = len(server.records)
+            server.offline = True
+            offline_exit, offline_native = run_player(
+                library, url, properties, env, pause_for_cache_state=True)
+            try:
+                state = json.loads(offline_native.get('cache_state') or '{}')
+            except ValueError:
+                state = {}
+            passed = (passed and offline_exit == 0 and offline_native.get('loaded')
+                      and len(server.records) == request_count
+                      and state.get('file-size') == len(server.payload)
+                      and state.get('cached-bytes', 0) > 0 and bool(state.get('ranges')))
         return {'case': kind, 'cache_enabled': enabled, 'passed': bool(passed),
-                'exit_code': child.returncode, 'native': native,
+                'exit_code': exit_code, 'native': native, 'offline_native': offline_native,
                 'requests': server.records, 'chunk_count': len(chunks)}
     finally:
         server.shutdown()
@@ -263,10 +315,11 @@ def main():
     if args.child:
         return player(library)
     if args.output_dir:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        filesystem_path(args.output_dir).mkdir(parents=True, exist_ok=True)
     results = []
-    with tempfile.TemporaryDirectory(prefix='floe-cache-http-', dir=args.output_dir) as directory:
-        scratch = Path(directory)
+    parent = (args.output_dir or Path(tempfile.gettempdir())).resolve()
+    scratch = Path(tempfile.mkdtemp(prefix='floe-cache-http-', dir=parent)).resolve()
+    try:
         fixture = args.fixture.resolve() if args.fixture else scratch / 'fixture.mp4'
         if not args.fixture:
             if not args.ffmpeg:
@@ -284,7 +337,10 @@ def main():
                 if not result['passed']:
                     print(json.dumps(result), flush=True)
                 if args.report:
-                    args.report.write_text(json.dumps(results, indent=2), encoding='utf8')
+                    filesystem_path(args.report).write_text(json.dumps(results, indent=2), encoding='utf8')
+    finally:
+        assert scratch.parent == parent and scratch != parent
+        shutil.rmtree(filesystem_path(scratch))
     return int(any(not result['passed'] for result in results))
 
 

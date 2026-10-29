@@ -188,7 +188,7 @@ static bool directory_exists(const char *path, bool create)
 {
     struct stat st;
     if (floe_cache_lstat(path, &st) == 0) return S_ISDIR(st.st_mode);
-    return create && errno == ENOENT && mkdir(path, 0700) == 0;
+    return create && errno == ENOENT && floe_cache_mkdir(path, 0700) == 0;
 }
 
 static char *read_file(void *ctx, const char *path, int maximum, int *length)
@@ -196,7 +196,7 @@ static char *read_file(void *ctx, const char *path, int maximum, int *length)
     struct stat st;
     if (floe_cache_lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
         st.st_size > maximum) return NULL;
-    int fd = open(path, O_RDONLY | O_BINARY);
+    int fd = floe_cache_open(path, O_RDONLY | O_BINARY, 0);
     if (fd < 0) return NULL;
     int size = st.st_size, used = 0;
     char *data = talloc_size(ctx, size + 1);
@@ -218,7 +218,7 @@ static bool write_atomic(const char *path, const void *data, int size)
     char *pending = talloc_asprintf(NULL, "%s.pending", path);
     struct stat st;
     bool regular = floe_cache_lstat(pending, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
-    int fd = regular ? open(pending, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600) : -1;
+    int fd = regular ? floe_cache_open(pending, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600) : -1;
     bool ok = fd >= 0;
     for (int offset = 0; ok && offset < size;) {
         int amount = write(fd, (const char *)data + offset, size - offset);
@@ -234,8 +234,8 @@ static bool write_atomic(const char *path, const void *data, int size)
 #endif
         if (close(fd) != 0) ok = false;
     }
-    if (ok) ok = rename(pending, path) == 0;
-    if (!ok && fd >= 0) unlink(pending);
+    if (ok) ok = floe_cache_rename(pending, path) == 0;
+    if (!ok && fd >= 0) floe_cache_unlink(pending);
     talloc_free(pending);
     return ok;
 }
@@ -288,11 +288,11 @@ static bool root_lock(struct floe_cache_stream *cache, struct cache_lock *lock)
     int error;
     bool safe = floe_cache_lstat(guard, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
     if (!safe) { errno = EINVAL; goto failed; }
-    lock->guard = open(guard, O_RDWR | O_CREAT | O_BINARY, 0600);
+    lock->guard = floe_cache_open(guard, O_RDWR | O_CREAT | O_BINARY, 0600);
     if (lock->guard < 0 || !lock_descriptor(lock->guard, true)) goto failed;
     safe = floe_cache_lstat(legacy, &st) != 0 ? errno == ENOENT : S_ISREG(st.st_mode);
     if (!safe) { errno = EINVAL; goto failed; }
-    lock->legacy = open(legacy, O_RDWR | O_CREAT | O_BINARY, 0600);
+    lock->legacy = floe_cache_open(legacy, O_RDWR | O_CREAT | O_BINARY, 0600);
     if (lock->legacy < 0 || !lock_descriptor(lock->legacy, false)) goto failed;
     talloc_free(ctx);
     return true;
@@ -460,7 +460,7 @@ static bool collect_leaf(void *ctx, const char *directory, bool legacy,
                          struct cache_file **files, int *count)
 {
     if (!directory_exists(directory, false)) return true;
-    DIR *dir = opendir(directory);
+    DIR *dir = floe_cache_opendir(directory);
     if (!dir) return false;
     struct dirent *item;
     while ((item = readdir(dir))) {
@@ -487,7 +487,7 @@ static bool collect_files(void *ctx, const char *root, struct cache_file **files
                           int *count)
 {
     *files = NULL; *count = 0;
-    DIR *dir = opendir(root);
+    DIR *dir = floe_cache_opendir(root);
     if (!dir) return false;
     struct dirent *item;
     bool ok = true;
@@ -498,7 +498,7 @@ static bool collect_files(void *ctx, const char *root, struct cache_file **files
             continue;
         }
         if (!source_name(item->d_name) || !directory_exists(source, false)) continue;
-        DIR *children = opendir(source);
+        DIR *children = floe_cache_opendir(source);
         if (!children) { ok = false; break; }
         struct dirent *child;
         while (ok && (child = readdir(children))) {
@@ -545,7 +545,7 @@ static bool make_room(struct floe_cache_stream *cache, int64_t extra,
     int64_t total = 0;
     for (int i = 0; ok && i < count; i++) {
         if (files[i].pending) {
-            ok = unlink(files[i].path) == 0;
+            ok = floe_cache_unlink(files[i].path) == 0;
             files[i].size = 0;
         }
         if (files[i].size > INT64_MAX - total) ok = false;
@@ -556,7 +556,7 @@ static bool make_room(struct floe_cache_stream *cache, int64_t extra,
         int64_t target = MPMAX(0, limit - extra - MPMIN(limit / 20, FLOE_CACHE_CHUNK_SIZE * 8));
         for (int i = 0; ok && i < count && total > target; i++) {
             if (files[i].pending || (protected_path && !strcmp(files[i].path, protected_path))) continue;
-            if (unlink(files[i].path) != 0) { ok = false; break; }
+            if (floe_cache_unlink(files[i].path) != 0) { ok = false; break; }
             total -= files[i].size;
         }
     }
@@ -582,7 +582,7 @@ static bool current_version(struct floe_cache_stream *cache)
 static void remove_media(struct floe_cache_stream *cache)
 {
     if (!directory_exists(cache->directory, false)) return;
-    DIR *dir = opendir(cache->directory);
+    DIR *dir = floe_cache_opendir(cache->directory);
     if (!dir) return;
     struct dirent *item;
     while ((item = readdir(dir))) {
@@ -590,7 +590,7 @@ static void remove_media(struct floe_cache_stream *cache)
             continue;
         char *path = mp_path_join(NULL, cache->directory, item->d_name);
         struct stat st;
-        if (floe_cache_lstat(path, &st) == 0 && S_ISREG(st.st_mode)) unlink(path);
+        if (floe_cache_lstat(path, &st) == 0 && S_ISREG(st.st_mode)) floe_cache_unlink(path);
         talloc_free(path);
     }
     closedir(dir);
@@ -714,7 +714,7 @@ static int read_cached(struct floe_cache_stream *cache, int64_t position,
         floe_cache_lstat(cache->read_path, &st) == 0 && S_ISREG(st.st_mode) &&
         st.st_size == cache->read_length;
     if (!in_memory) {
-        DIR *dir = opendir(cache->directory);
+        DIR *dir = floe_cache_opendir(cache->directory);
         if (!dir) { root_unlock(&lock); return 0; }
         struct dirent *item;
         struct cache_chunk chosen = {0}, chunk;
@@ -743,7 +743,7 @@ static int read_cached(struct floe_cache_stream *cache, int64_t position,
         char checksum[65] = {0};
         if (bytes) sha256(checksum, bytes, length);
         if (!bytes || length != chosen.length || strcmp(checksum, chosen.checksum)) {
-            if (valid_lease(cache)) unlink(path);
+            if (valid_lease(cache)) floe_cache_unlink(path);
             talloc_free(path); talloc_free(ctx); root_unlock(&lock); return 0;
         }
         if (!cache->read_buffer) cache->read_buffer = talloc_size(cache, FLOE_CACHE_CHUNK_SIZE);
@@ -771,7 +771,7 @@ static int64_t next_cached_start(struct floe_cache_stream *cache, int64_t positi
     int64_t end = cache->metadata.length > 0 ? cache->metadata.length : 0;
     struct cache_lock lock;
     if (!cache->metadata.cacheable || !root_lock_for_io(cache, &lock)) return end;
-    DIR *dir = opendir(cache->directory);
+    DIR *dir = floe_cache_opendir(cache->directory);
     if (dir) {
         struct dirent *item;
         struct cache_chunk chunk;
@@ -989,7 +989,7 @@ bool stream_floe_cache_get_state(struct stream *s, struct mpv_node *node)
     node_map_add_int64(node, "file-size", cache->metadata.length);
     struct mpv_node *ranges = node_map_add(node, "ranges", MPV_FORMAT_NODE_ARRAY);
     int64_t size = 0;
-    DIR *dir = current_version(cache) ? opendir(cache->directory) : NULL;
+    DIR *dir = current_version(cache) ? floe_cache_opendir(cache->directory) : NULL;
     struct dirent *item;
     struct cache_chunk chunk;
     if (dir) {

@@ -14,6 +14,7 @@
 #include "mpv_talloc.h"
 #include "common/common.h"
 #include "misc/hash.h"
+#include "misc/node.h"
 #include "misc/path_utils.h"
 #include "osdep/io.h"
 #include "osdep/threads.h"
@@ -40,6 +41,20 @@ static struct input input;
 static char *base;
 static const char *source = "12345678-1234-1234-1234-123456789abc";
 static const char *url = "https://origin/movie.mp4";
+
+static FILE *cache_fopen(const char *path, const char *mode)
+{
+#ifdef _WIN32
+    wchar_t *wide = floe_cache_windows_path(NULL, path);
+    if (!wide) return NULL;
+    wchar_t *wide_mode = mp_from_utf8(NULL, mode);
+    FILE *file = _wfopen(wide, wide_mode);
+    talloc_free(wide_mode); talloc_free(wide);
+    return file;
+#else
+    return fopen(path, mode);
+#endif
+}
 
 struct floe_cache_curl_session *stream_curl_floe_cache_snapshot(void *ctx, struct stream *s)
 {
@@ -163,7 +178,7 @@ static char *media_directory(const char *root, const char *key)
 static char *chunk_file(const char *root, const char *key)
 {
     char *directory = media_directory(root, key), *path = NULL;
-    DIR *dir = opendir(directory);
+    DIR *dir = floe_cache_opendir(directory);
     assert(dir);
     struct dirent *entry;
     while ((entry = readdir(dir))) {
@@ -178,7 +193,7 @@ static char *chunk_file(const char *root, const char *key)
 }
 static int64_t data_size(const char *directory)
 {
-    DIR *dir = opendir(directory);
+    DIR *dir = floe_cache_opendir(directory);
     if (!dir) return 0;
     int64_t size = 0;
     struct dirent *entry;
@@ -197,18 +212,18 @@ static int64_t data_size(const char *directory)
 static void clear_media(const char *root, const char *key)
 {
     char *directory = media_directory(root, key);
-    DIR *dir = opendir(directory);
+    DIR *dir = floe_cache_opendir(directory);
     if (dir) {
         struct dirent *entry;
         while ((entry = readdir(dir))) {
             if (entry->d_name[0] == '.') continue;
             char *path = mp_path_join(NULL, directory, entry->d_name);
-            assert(unlink(path) == 0); talloc_free(path);
+            assert(floe_cache_unlink(path) == 0); talloc_free(path);
         }
         closedir(dir);
     }
     char *epoch = mp_path_join(NULL, root, ".epoch");
-    FILE *file = fopen(epoch, "wb"); assert(file);
+    FILE *file = cache_fopen(epoch, "wb"); assert(file);
     for (int i = 0; i < 64; i++) fputc('0', file);
     assert(fclose(file) == 0);
     talloc_free(epoch); talloc_free(directory);
@@ -298,7 +313,7 @@ static void test_lock_contention(void)
     char *root = mp_path_join(NULL, base, "contention"), *key = key_for("movie");
     struct stream *s = open_cache(root, key, 1024 * 1024);
     char *path = mp_path_join(NULL, root, ".lock-v2");
-    int fd = open(path, O_RDWR | O_BINARY); assert(fd >= 0);
+    int fd = floe_cache_open(path, O_RDWR | O_BINARY, 0); assert(fd >= 0);
 #ifdef _WIN32
     OVERLAPPED position = {0};
     assert(LockFileEx((HANDLE)_get_osfhandle(fd), LOCKFILE_EXCLUSIVE_LOCK |
@@ -358,7 +373,7 @@ static void test_corruption(void)
         char *root = mp_path_join(NULL, base, name), *key = key_for("movie");
         seed(root, key, input.length);
         char *chunk = chunk_file(root, key); assert(chunk);
-        FILE *file = fopen(chunk, truncated ? "wb" : "r+b"); assert(file);
+        FILE *file = cache_fopen(chunk, truncated ? "wb" : "r+b"); assert(file);
         fputc('X', file); assert(fclose(file) == 0);
         input.opens = 0;
         struct stream *s = open_cache(root, key, 1024 * 1024);
@@ -450,9 +465,17 @@ static void test_file_paths(void)
 {
     reset_input();
     char *root = mp_path_join(NULL, base, "\xE6\x96\x87\xE4\xBB\xB6\xE7\xBC\x93\xE5\xAD\x98");
+    assert(floe_cache_mkdir(root, 0700) == 0);
+    for (int i = 0; i < 4; i++) {
+        char *next = mp_path_join(NULL, root,
+            "long-cache-directory-0123456789012345678901234567890123456789");
+        assert(floe_cache_mkdir(next, 0700) == 0);
+        talloc_free(root); root = next;
+    }
     char *key = key_for("unicode-path");
     seed(root, key, input.length);
     char *chunk = chunk_file(root, key); assert(chunk);
+    assert(strlen(chunk) > 260);
     struct stat st;
     assert(floe_cache_lstat(chunk, &st) == 0 && S_ISREG(st.st_mode));
     assert(st.st_size == input.length);
@@ -460,11 +483,16 @@ static void test_file_paths(void)
     assert(!floe_cache_path_missing(chunk));
     char *missing = mp_path_join(NULL, root, "missing");
     assert(floe_cache_path_missing(missing));
+    char *renamed = talloc_asprintf(NULL, "%s.renamed", chunk);
+    assert(floe_cache_rename(chunk, renamed) == 0);
+    assert(floe_cache_path_missing(chunk));
+    assert(floe_cache_lstat(renamed, &st) == 0 && st.st_size == input.length);
+    assert(floe_cache_rename(renamed, chunk) == 0);
     char *link = mp_path_join(NULL, root, "link.chunk");
     bool created = false;
 #ifdef _WIN32
-    wchar_t *wide_link = mp_from_utf8(NULL, link);
-    wchar_t *wide_target = mp_from_utf8(NULL, chunk);
+    wchar_t *wide_link = floe_cache_windows_path(NULL, link);
+    wchar_t *wide_target = floe_cache_windows_path(NULL, chunk);
     created = CreateSymbolicLinkW(wide_link, wide_target, 0x2) != 0;
     talloc_free(wide_link); talloc_free(wide_target);
 #else
@@ -474,15 +502,45 @@ static void test_file_paths(void)
         assert(floe_cache_lstat(link, &st) == 0);
         assert(!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode));
         assert(!floe_cache_path_missing(link));
-        assert(unlink(link) == 0);
+        assert(floe_cache_unlink(link) == 0);
     }
     input.offline = true; input.opens = 0;
     struct stream *s = open_cache(root, key, 1024 * 1024);
     assert(read_cache(s, 0, input.length, 'A') == input.length);
-    assert(input.opens == 0); free_stream(s);
+    assert(input.opens == 0);
+    struct mpv_node state;
+    assert(stream_floe_cache_get_state(s, &state));
+    struct mpv_node *cached = node_map_get(&state, "cached-bytes");
+    struct mpv_node *ranges = node_map_get(&state, "ranges");
+    assert(cached && cached->format == MPV_FORMAT_INT64 && cached->u.int64 == input.length);
+    assert(ranges && ranges->format == MPV_FORMAT_NODE_ARRAY && ranges->u.list->num > 0);
+    talloc_free(state.u.list);
+    free_stream(s);
+#ifdef _WIN32
+    char *extended = floe_cache_windows_utf8_path(root);
+    assert(extended);
+    s = open_cache(extended, key, 1024 * 1024);
+    assert(read_cache(s, 0, input.length, 'A') == input.length);
+    assert(input.opens == 0); free_stream(s); talloc_free(extended);
+
+    const char *paths[][2] = {
+        {"C:/cache/../video/file.chunk", "\\\\?\\C:\\video\\file.chunk"},
+        {"//cache-server/share/video/file.chunk", "\\\\?\\UNC\\cache-server\\share\\video\\file.chunk"},
+        {"\\\\?\\C:\\video/file.chunk", "\\\\?\\C:\\video\\file.chunk"},
+        {"\\\\?\\UNC\\cache-server\\share/video/file.chunk", "\\\\?\\UNC\\cache-server\\share\\video\\file.chunk"},
+    };
+    for (int i = 0; i < MP_ARRAY_SIZE(paths); i++) {
+        char *native = floe_cache_windows_utf8_path(paths[i][0]);
+        assert(native && !strcmp(native, paths[i][1])); talloc_free(native);
+    }
+#endif
+    clear_media(root, key);
+    assert(!chunk_file(root, key));
+    assert(data_size(root) == 0);
+    talloc_free(renamed);
     talloc_free(link); talloc_free(missing); talloc_free(chunk);
     talloc_free(root); talloc_free(key);
-    puts("UTF-8 cache paths and no-follow file metadata passed");
+    puts("long UTF-8 cache paths preserve publication, coverage, offline reads and cleanup");
 }
 
 int main(int argc, char **argv)

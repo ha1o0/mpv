@@ -15,12 +15,126 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
+
+// libmpv inherits the host process's manifest and long-path policy. Cache
+// filenames contain three hashes, so even a short root exceeds MAX_PATH.
+// Normalize separators and relative components before adding the extended
+// prefix; Win32 treats '/' literally after that prefix.
+static inline wchar_t *floe_cache_windows_path(void *ctx, const char *path)
+{
+    wchar_t *wide = mp_from_utf8(ctx, path);
+    for (wchar_t *p = wide; *p; p++) {
+        if (*p == L'/') *p = L'\\';
+    }
+    if (!wcsncmp(wide, L"\\\\?\\", 4)) return wide;
+
+    DWORD count = GetFullPathNameW(wide, 0, NULL, NULL);
+    if (!count || count > MP_PATH_MAX - 8) {
+        talloc_free(wide);
+        errno = count ? ENAMETOOLONG : EINVAL;
+        return NULL;
+    }
+    wchar_t *full = talloc_array(wide, wchar_t, count);
+    DWORD length = GetFullPathNameW(wide, count, full, NULL);
+    if (!length || length >= count) {
+        talloc_free(wide);
+        errno = EINVAL;
+        return NULL;
+    }
+    bool unc = full[0] == L'\\' && full[1] == L'\\';
+    const wchar_t *prefix = unc ? L"\\\\?\\UNC\\" : L"\\\\?\\";
+    size_t prefix_length = wcslen(prefix), skip = unc ? 2 : 0;
+    wchar_t *result = talloc_array(ctx, wchar_t, prefix_length + length - skip + 1);
+    wmemcpy(result, prefix, prefix_length);
+    wmemcpy(result + prefix_length, full + skip, length - skip + 1);
+    talloc_free(wide);
+    return result;
+}
+
+static inline char *floe_cache_windows_utf8_path(const char *path)
+{
+    wchar_t *wide = floe_cache_windows_path(NULL, path);
+    if (!wide) return NULL;
+    char *result = mp_to_utf8(NULL, wide);
+    talloc_free(wide);
+    return result;
+}
 #endif
+
+// Limit extended-path handling to the cache. POSIX keeps the original paths
+// and filesystem calls, including its existing no-follow ownership checks.
+static inline int floe_cache_open(const char *path, int flags, int mode)
+{
+#ifdef _WIN32
+    char *native = floe_cache_windows_utf8_path(path);
+    if (!native) return -1;
+    int result = open(native, flags, mode);
+    talloc_free(native);
+    return result;
+#else
+    return open(path, flags, mode);
+#endif
+}
+
+static inline int floe_cache_mkdir(const char *path, int mode)
+{
+#ifdef _WIN32
+    char *native = floe_cache_windows_utf8_path(path);
+    if (!native) return -1;
+    int result = mkdir(native, mode);
+    talloc_free(native);
+    return result;
+#else
+    return mkdir(path, mode);
+#endif
+}
+
+static inline DIR *floe_cache_opendir(const char *path)
+{
+#ifdef _WIN32
+    char *native = floe_cache_windows_utf8_path(path);
+    if (!native) return NULL;
+    DIR *result = opendir(native);
+    talloc_free(native);
+    return result;
+#else
+    return opendir(path);
+#endif
+}
+
+static inline int floe_cache_unlink(const char *path)
+{
+#ifdef _WIN32
+    char *native = floe_cache_windows_utf8_path(path);
+    if (!native) return -1;
+    int result = unlink(native);
+    talloc_free(native);
+    return result;
+#else
+    return unlink(path);
+#endif
+}
+
+static inline int floe_cache_rename(const char *from, const char *to)
+{
+#ifdef _WIN32
+    char *native_from = floe_cache_windows_utf8_path(from);
+    if (!native_from) return -1;
+    char *native_to = floe_cache_windows_utf8_path(to);
+    int result = native_to ? rename(native_from, native_to) : -1;
+    talloc_free(native_to);
+    talloc_free(native_from);
+    return result;
+#else
+    return rename(from, to);
+#endif
+}
 
 static inline int floe_cache_lstat(const char *path, struct stat *st)
 {
 #ifdef _WIN32
-    wchar_t *wide = mp_from_utf8(NULL, path);
+    wchar_t *wide = floe_cache_windows_path(NULL, path);
+    if (!wide) return -1;
     HANDLE handle = CreateFileW(wide, FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT |
@@ -69,7 +183,8 @@ static inline bool floe_cache_path_missing(const char *path)
 static inline int floe_cache_touch(const char *path)
 {
 #ifdef _WIN32
-    wchar_t *wide = mp_from_utf8(NULL, path);
+    wchar_t *wide = floe_cache_windows_path(NULL, path);
+    if (!wide) return -1;
     HANDLE handle = CreateFileW(wide, FILE_WRITE_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT |
