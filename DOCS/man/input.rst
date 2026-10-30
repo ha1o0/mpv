@@ -1682,6 +1682,12 @@ Miscellaneous Commands
     exceeds 4096 packets, 32 MiB, or 60 seconds of keyframe preroll. These bounds
     limit temporary preview work, not persistent coverage or time indexes.
 
+    Missing decoding timestamps (for example, native MKV packets) are derived
+    on the copied packets without changing their presentation timestamps or
+    assuming a frame rate. Open-GOP leading pictures use a preceding cached
+    keyframe when needed. The clip's playback origin is its first keyframe,
+    including when muxing rebases negative decoding timestamps.
+
     After the clip closes, ``<filename>.json`` contains ``position``: the
     requested timestamp relative to the clip's timestamp origin, in seconds.
     Decode that position with normal start-time rebasing. Callers must wait for

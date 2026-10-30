@@ -28,6 +28,7 @@
 #include <sys/types.h>
 
 #include "cache.h"
+#include "cache_snapshot.h"
 #include "config.h"
 #include "options/m_config.h"
 #include "options/m_option.h"
@@ -4385,8 +4386,28 @@ struct demux_cache_snapshot *demux_cache_snapshot_video(
     struct demux_cached_range *r = find_cache_seek_range(in, target, 0);
     if (!r || index >= r->num_streams)
         goto done;
-    struct demux_packet *first = find_seek_target(r->streams[index], target, 0);
+    struct demux_queue *queue = r->streams[index];
+    struct demux_packet *first = find_seek_target(queue, target, 0);
+    // Open GOPs can contain leading B pictures before their keyframe's PTS.
+    // The normal cache seek chooses that GOP by its minimum presentation time.
+    // A standalone clip also needs the preceding keyframe for those pictures.
+    if (first && first->pts != MP_NOPTS_VALUE && first->pts > target) {
+        double start;
+        compute_keyframe_times(first, &start, NULL);
+        // Begin at the preceding sparse index entry, not the cache head:
+        // a large back buffer must not make each preview scan the whole file.
+        struct demux_packet *scan = search_index(queue, nextafter(start, -INFINITY));
+        if (!scan)
+            scan = queue->head;
+        struct demux_packet *previous = NULL;
+        for (struct demux_packet *dp = scan; dp && dp != first; dp = dp->next) {
+            if (dp->keyframe && dp->pts != MP_NOPTS_VALUE && dp->pts <= target)
+                previous = dp;
+        }
+        first = previous;
+    }
     if (!first || !first->keyframe || first->pts == MP_NOPTS_VALUE ||
+        !isfinite(first->pts) ||
         first->pts > target || target - first->pts > 60)
         goto done;
 
@@ -4399,6 +4420,9 @@ struct demux_cache_snapshot *demux_cache_snapshot_video(
         .native_tb_den = stream->codec->native_tb_den,
     };
     s->stream = (struct sh_stream){.type = STREAM_VIDEO, .codec = &s->codec};
+    // Anchor playback to the first keyframe, as the preview demuxer does after
+    // NUT's normal timestamp rebasing. Open-GOP leading pictures can have
+    // earlier PTS but are discarded on random access.
     s->base = first->pts;
     s->target = target;
     size_t bytes = 0;
@@ -4406,24 +4430,27 @@ struct demux_cache_snapshot *demux_cache_snapshot_video(
     for (struct demux_packet *dp = first; dp; dp = dp->next) {
         // Clone just the GOP needed by an independent decoder. These bounds
         // cap transient work under the demux lock, not persistent cache size.
-        if (s->num_packets >= 4096 || dp->segmented || dp->is_wrapped_avframe)
+        if (s->num_packets >= MP_CACHE_SNAPSHOT_MAX_PACKETS ||
+            dp->segmented || dp->is_wrapped_avframe)
             goto fail;
-        if (dp != first && dp->keyframe && dp->pts > target + 0.1)
-            break;
+        if (dp != first && dp->keyframe) {
+            double start;
+            compute_keyframe_times(dp, &start, NULL);
+            // Compare the complete GOP's presentation range, not just the
+            // keyframe. Cutting at a later keyframe PTS can omit leading B
+            // pictures at the requested time, or their reference frame.
+            if (start != MP_NOPTS_VALUE && start > target + 0.1 &&
+                last != MP_NOPTS_VALUE && last >= target)
+                break;
+        }
         struct demux_packet *copy = read_packet_from_cache(in, dp);
         if (!copy)
             goto fail;
-        // Native MKV packets can omit DTS even with AVCodecParameters present.
-        // Give the muxer the recorder's conservative reordering window rather
-        // than letting it treat nonmonotonic B-frame PTS as decoding times.
-        if (copy->dts == MP_NOPTS_VALUE && s->codec.lav_codecpar)
-            s->codec.lav_codecpar->video_delay = 16;
         talloc_steal(s, copy);
         if (copy->len > 32 * 1024 * 1024 - bytes)
             goto fail;
         MP_TARRAY_APPEND(s, s->packets, s->num_packets, copy);
         bytes += copy->len;
-        s->base = MP_PTS_MIN(s->base, dp->pts);
         last = MP_PTS_MAX(last, dp->pts);
     }
     if (!s->codec.lav_codecpar || last == MP_NOPTS_VALUE || last < target)
@@ -4436,9 +4463,53 @@ done:
     return s;
 }
 
+static bool fix_cache_snapshot_dts(struct demux_cache_snapshot *s)
+{
+    bool missing = false;
+    for (int n = 0; n < s->num_packets; n++) {
+        double dts = s->packets[n]->dts;
+        missing |= dts == MP_NOPTS_VALUE || !isfinite(dts);
+    }
+    if (!missing)
+        return true;
+
+    AVRational tb = mp_get_codec_timebase(&s->codec);
+    struct mp_cache_snapshot_timestamp *times =
+        talloc_array(s, struct mp_cache_snapshot_timestamp, s->num_packets);
+    if (!times)
+        return false;
+    bool ok = false;
+    for (int n = 0; n < s->num_packets; n++) {
+        double pts = s->packets[n]->pts;
+        if (pts == MP_NOPTS_VALUE || !isfinite(pts))
+            goto done;
+        double ticks = (pts - s->base) / av_q2d(tb);
+        if (!isfinite(ticks) ||
+            ticks >= (double)INT64_MAX || ticks <= (double)INT64_MIN)
+            goto done;
+        times[n] = (struct mp_cache_snapshot_timestamp) {
+            .pts = mp_pts_to_av(pts - s->base, &tb),
+            .dts = INT64_MIN,
+        };
+    }
+    if (!mp_cache_snapshot_fix_dts(times, s->num_packets))
+        goto done;
+    for (int n = 0; n < s->num_packets; n++)
+        s->packets[n]->dts = s->base + mp_pts_from_av(times[n].dts, &tb);
+    ok = true;
+done:
+    talloc_free(times);
+    return ok;
+}
+
 bool demux_cache_snapshot_write(struct demux_cache_snapshot *s,
                                struct mpv_global *global, const char *file)
 {
+    // Native MKV packets may have neither DTS nor a packet duration. FFmpeg's
+    // fixed video_delay fallback then repeats/reverses DTS on reordered frames.
+    // Normalize only these owned copies, outside the demux/core locks.
+    if (!fix_cache_snapshot_dts(s))
+        return false;
     struct sh_stream *streams[] = {&s->stream};
     struct mp_recorder *recorder = mp_recorder_create(global, file, streams, 1,
                                                      NULL, 0);

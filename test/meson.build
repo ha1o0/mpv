@@ -96,6 +96,11 @@ test('json', json)
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 
+cache_snapshot = executable('cache-snapshot', files('cache_snapshot.c'),
+                            include_directories: incdir,
+                            objects: libmpv.extract_objects('demux/cache_snapshot.c'))
+test('cache-snapshot', cache_snapshot)
+
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 
@@ -172,6 +177,9 @@ if get_option('libmpv')
         # ctypes loads the built library into the host Python process. Run
         # cross-built libraries separately on their target with this script.
         if not meson.is_cross_build()
+            test('libmpv-cache-preview', python,
+                 args: [files('floe_cache_preview.py'), '--library', mpvlib.full_path()],
+                 depends: mpvlib, timeout: 90, suite: 'libmpv')
             test('libmpv-mkv-startup', python,
                  args: [files('mkv_startup.py'), '--libmpv', mpvlib.full_path()],
                  depends: mpvlib, timeout: 300, suite: 'libmpv')

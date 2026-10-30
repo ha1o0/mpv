@@ -93,6 +93,7 @@ sources = files(
     'demux/codec_tags.c',
     'demux/cue.c',
     'demux/cache.c',
+    'demux/cache_snapshot.c',
     'demux/demux.c',
     'demux/demux_cue.c',
     'demux/demux_disc.c',
