@@ -117,7 +117,7 @@ test('paths', paths)
 
 if features['libcurl']
     floe_cache = executable('floe-cache', files('floe_cache.c'),
-                           include_directories: incdir,
+                           include_directories: [incdir, incdir_public],
                            objects: libmpv.extract_objects('stream/stream_floe_cache.c', 'misc/hash.c'),
                            link_with: test_utils)
     test('floe-cache', floe_cache, args: outdir)
@@ -182,6 +182,14 @@ if get_option('libmpv')
                          args: [files('floe_cache_http.py'), '--library', mpvlib.full_path(),
                                 '--ffmpeg', cache_ffmpeg.full_path(), '--output-dir', outdir],
                          depends: mpvlib, timeout: 120, suite: 'libmpv')
+                    cache_ffprobe = find_program('ffprobe', required: false)
+                    if cache_ffprobe.found()
+                        test('libmpv-floe-cache-timeline', python,
+                             args: [files('floe_cache_timeline.py'), '--library', mpvlib.full_path(),
+                                    '--ffmpeg', cache_ffmpeg.full_path(),
+                                    '--ffprobe', cache_ffprobe.full_path()],
+                             depends: mpvlib, timeout: 180, suite: 'libmpv')
+                    endif
                 endif
             endif
         endif

@@ -330,6 +330,9 @@ void demux_set_ts_offset(struct demuxer *demuxer, double offset);
 void demux_get_bitrate_stats(struct demuxer *demuxer, double *rates);
 void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *r);
 
+struct mpv_node;
+void demux_get_cache_time_map(struct demuxer *demuxer, struct mpv_node *node);
+
 void demux_block_reading(struct demuxer *demuxer, bool block);
 
 void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,

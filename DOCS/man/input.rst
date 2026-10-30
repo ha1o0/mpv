@@ -2666,11 +2666,28 @@ Property list
 
 ``floe-cache-state``
     Returns the persistent byte-cache state for the current stream when Floe's
-    native cache wrapper is enabled. The map contains ``key``, ``directory``,
+    native cache wrapper is enabled. The map contains ``key``, ``version``, ``directory``,
     ``max-bytes``, ``cached-bytes`` and ``file-size`` when known. ``ranges``
     is an array of byte ranges with ``start`` and ``end`` offsets. These are
     byte ranges, not timestamps; applications may combine them with demuxer
     timing information when rendering persistent cache coverage.
+
+``demuxer-cache-time-map``
+    Read-only source-byte/timestamp associations from the main demuxer's
+    selected audio/video packet queues. The map contains ``schema`` (currently
+    1), ``path`` (the demuxer's filename), and ``tracks``. Each track contains
+    its internal stream ``id``, ``type`` (``audio`` or ``video``), and ``ranges``.
+    A range is ``[byteStart, byteEnd, startSeconds, endSeconds]`` with exclusive
+    ends and the same timestamp offset as playback. All valid associations in
+    the selected packet queues are reported, without a fixed per-track count
+    cutoff. Missing or unreliable source positions are omitted.
+
+    These are observed keyframe/index associations, not an interpolation by
+    bitrate and not a claim that the bytes are cached. Consumers must verify
+    the complete byte interval against their persistent cache and intersect
+    selected tracks before displaying time coverage. Querying does not seek,
+    read the stream, or change the packet queues. Associations can disappear
+    as queues are pruned; persisting them requires content-version isolation.
 
 ``demuxer-via-network``
     Whether the stream demuxed via the main demuxer is most likely played via

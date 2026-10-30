@@ -61,4 +61,6 @@ struct floe_cache_curl_session *stream_curl_floe_cache_snapshot(void *ctx, struc
 bool stream_curl_floe_cache_allowed(struct floe_cache_curl_session *session);
 
 bool stream_floe_cache_get_state(struct stream *s, struct mpv_node *node);
+bool stream_floe_cache_flush_due(struct stream *s);
+void stream_floe_cache_flush(struct stream *s);
 

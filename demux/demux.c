@@ -38,11 +38,15 @@
 #include "common/recorder.h"
 #include "common/stats.h"
 #include "misc/charset_conv.h"
+#include "misc/node.h"
+#include "mpv/client.h"
+#include <libavcodec/packet.h>
 #include "misc/thread_tools.h"
 #include "osdep/timer.h"
 #include "osdep/threads.h"
 
 #include "stream/stream.h"
+#include "stream/stream_floe_cache.h"
 #include "demux.h"
 #include "packet_pool.h"
 #include "timeline.h"
@@ -2669,6 +2673,16 @@ static MP_THREAD_VOID demux_thread(void *pctx)
     while (!in->thread_terminate) {
         if (thread_work(in))
             continue;
+        // Low-bitrate readahead may never fill a 4 MiB fragment while paused.
+        // Publish that verified prefix after a bounded delay, outside the
+        // demux lock, then recheck work so no wakeup/seek is lost during I/O.
+        struct stream *stream = in->d_thread->stream;
+        if (stream && stream->floe_cache && stream_floe_cache_flush_due(stream)) {
+            mp_mutex_unlock(&in->lock);
+            stream_floe_cache_flush(stream);
+            mp_mutex_lock(&in->lock);
+            continue;
+        }
         mp_cond_signal(&in->wakeup);
         mp_cond_timedwait_until(&in->wakeup, &in->lock, in->next_cache_update);
     }
@@ -4725,6 +4739,81 @@ void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *
         }
     }
 
+    mp_mutex_unlock(&in->lock);
+}
+
+static void cache_time_span(struct mpv_node *ranges, int64_t start_pos,
+                           int64_t end_pos, double start, double end, int64_t size)
+{
+    if (start_pos < 0 || end_pos <= start_pos ||
+        (size >= 0 && end_pos > size) || start == MP_NOPTS_VALUE ||
+        end == MP_NOPTS_VALUE || !isfinite(start) || !isfinite(end) || end <= start)
+        return;
+    struct mpv_node *span = node_array_add(ranges, MPV_FORMAT_NODE_ARRAY);
+    node_array_add(span, MPV_FORMAT_INT64)->u.int64 = start_pos;
+    node_array_add(span, MPV_FORMAT_INT64)->u.int64 = end_pos;
+    node_array_add(span, MPV_FORMAT_DOUBLE)->u.double_ = start;
+    node_array_add(span, MPV_FORMAT_DOUBLE)->u.double_ = end;
+}
+
+// An opt-in read-only query. It does not seek, read the stream, modify packet
+// queues, or change the normal demuxer-cache-state / playback path.
+void demux_get_cache_time_map(struct demuxer *demuxer, struct mpv_node *node)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_assert(demuxer == in->d_user);
+    mp_mutex_lock(&in->lock);
+    node_init(node, MPV_FORMAT_NODE_MAP, NULL);
+    node_map_add_int64(node, "schema", 1);
+    node_map_add_string(node, "path", demuxer->filename);
+    struct mpv_node *tracks = node_map_add(node, "tracks", MPV_FORMAT_NODE_ARRAY);
+    for (int n = 0; n < in->num_streams; n++) {
+        struct demux_stream *ds = in->streams[n]->ds;
+        if (!ds->selected || !ds->eager || ds->still_image || ds->sh->attached_picture ||
+            (ds->type != STREAM_VIDEO && ds->type != STREAM_AUDIO)) continue;
+        struct mpv_node *track = node_array_add(tracks, MPV_FORMAT_NODE_MAP);
+        node_map_add_int64(track, "id", ds->index);
+        node_map_add_string(track, "type", ds->type == STREAM_VIDEO ? "video" : "audio");
+        struct mpv_node *ranges = node_map_add(track, "ranges", MPV_FORMAT_NODE_ARRAY);
+        for (int r = 0; r < in->num_ranges; r++) {
+            if (n >= in->ranges[r]->num_streams) continue;
+            struct demux_queue *q = in->ranges[r]->streams[n];
+            for (size_t i = 0; i + 1 < q->num_index; i++) {
+                struct index_entry *a = &QUEUE_INDEX_ENTRY(q, i);
+                struct index_entry *b = &QUEUE_INDEX_ENTRY(q, i + 1);
+                // Keyframe positions remain the true source positions; mpv's
+                // synthetic non-keyframe position fixups are never used here.
+                cache_time_span(ranges, a->pkt->pos, b->pkt->pos,
+                    MP_ADD_PTS(a->pts, in->ts_offset),
+                    MP_ADD_PTS(b->pts, in->ts_offset), in->stream_size);
+            }
+            if (q->num_index && q->keyframe_latest) {
+                struct index_entry *a = &QUEUE_INDEX_ENTRY(q, q->num_index - 1);
+                double end;
+                compute_keyframe_times(q->keyframe_latest, &end, NULL);
+                cache_time_span(ranges, a->pkt->pos, q->keyframe_latest->pos,
+                    MP_ADD_PTS(a->pts, in->ts_offset),
+                    MP_ADD_PTS(end, in->ts_offset), in->stream_size);
+            }
+            struct demux_packet *tail = q->tail;
+            struct demux_packet *latest = q->keyframe_latest;
+            if (latest && tail && !tail->is_cached && tail->avpacket) {
+                double start;
+                compute_keyframe_times(latest, &start, NULL);
+                cache_time_span(ranges, latest->pos, tail->avpacket->pos,
+                    MP_ADD_PTS(start, in->ts_offset),
+                    MP_ADD_PTS(MP_PTS_OR_DEF(tail->pts, tail->dts), in->ts_offset),
+                    in->stream_size);
+            }
+            if (q->is_eof && q->num_index && tail && in->stream_size > 0) {
+                struct index_entry *a = &QUEUE_INDEX_ENTRY(q, q->num_index - 1);
+                double end = MP_ADD_PTS(q->seek_end, MPMAX(0, tail->duration));
+                cache_time_span(ranges, a->pkt->pos, in->stream_size,
+                    MP_ADD_PTS(a->pts, in->ts_offset),
+                    MP_ADD_PTS(end, in->ts_offset), in->stream_size);
+            }
+        }
+    }
     mp_mutex_unlock(&in->lock);
 }
 

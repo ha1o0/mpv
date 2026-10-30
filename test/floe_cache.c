@@ -15,6 +15,7 @@
 #include "common/common.h"
 #include "misc/hash.h"
 #include "misc/node.h"
+#include "mpv/client.h"
 #include "misc/path_utils.h"
 #include "osdep/io.h"
 #include "osdep/threads.h"
@@ -420,6 +421,92 @@ static void test_quota_and_clear(void)
     puts("root quota and clear revocation protect newer same-version cache");
 }
 
+static void check_disjoint(struct stream *s, int64_t expected)
+{
+    struct mpv_node state;
+    assert(stream_floe_cache_get_state(s, &state));
+    struct mpv_node *ranges = node_map_get(&state, "ranges");
+    int64_t total = 0;
+    for (int i = 0; i < ranges->u.list->num; i++) {
+        struct mpv_node *a = &ranges->u.list->values[i];
+        int64_t start = node_map_get(a, "start")->u.int64;
+        int64_t end = node_map_get(a, "end")->u.int64;
+        total += end - start;
+        for (int j = 0; j < i; j++) {
+            struct mpv_node *b = &ranges->u.list->values[j];
+            assert(end <= node_map_get(b, "start")->u.int64 ||
+                   start >= node_map_get(b, "end")->u.int64);
+        }
+    }
+    assert(total == expected);
+    talloc_free(state.u.list);
+}
+
+static void test_deduplication(void)
+{
+    reset_input();
+    char *root = mp_path_join(NULL, base, "dedup"), *key = key_for("movie");
+    // Both readers have overlapping bytes in flight before either publishes.
+    struct stream *a = open_cache(root, key, 1024 * 1024);
+    struct stream *b = open_cache(root, key, 1024 * 1024);
+    assert(read_cache(a, 0, 16384, 'A') == 16384);
+    assert(read_cache(b, 8192, 16384, 'A') == 16384);
+    free_stream(a);
+    int64_t before = data_size(root);
+    free_stream(b);
+    assert(data_size(root) == before + 8192);
+    input.offline = true; input.opens = 0;
+    a = open_cache(root, key, 1024 * 1024);
+    check_disjoint(a, 24576);
+    for (int offset = 0; offset < 24576;) {
+        int got = read_cache(a, offset, 24576 - offset, 'A');
+        assert(got > 0); offset += got;
+    }
+    assert(input.opens == 0);
+    free_stream(a);
+    talloc_free(root);
+
+    // Reserve all holes together, while protecting the reused middle islands.
+    reset_input();
+    root = mp_path_join(NULL, base, "dedup-quota");
+    a = open_cache(root, key, 1024 * 1024);
+    assert(read_cache(a, 0, 32768, 'A') == 32768);
+    b = open_cache(root, key, 1024 * 1024);
+    assert(read_cache(b, 8192, 8192, 'A') == 8192);
+    assert(read_cache(b, 24576, 8192, 'A') == 8192);
+    free_stream(b);
+    before = data_size(root);
+    char *quota = mp_path_join(NULL, root, ".quota");
+    FILE *file = cache_fopen(quota, "wb"); assert(file);
+    fprintf(file, "%lld", (long long)(before + 16384));
+    assert(fclose(file) == 0);
+    free_stream(a);
+    assert(data_size(root) == before + 16384);
+    a = open_cache(root, key, 1024 * 1024);
+    check_disjoint(a, 32768);
+    free_stream(a);
+    talloc_free(quota); talloc_free(root);
+
+    for (int truncated = 0; truncated < 2; truncated++) {
+        reset_input();
+        root = talloc_asprintf(NULL, "%s/dedup-corrupt-%d", base, truncated);
+        a = open_cache(root, key, 1024 * 1024);
+        assert(read_cache(a, 0, 16384, 'A') == 16384);
+        b = open_cache(root, key, 1024 * 1024);
+        assert(read_cache(b, 4096, 4096, 'A') == 4096); free_stream(b);
+        char *path = chunk_file(root, key);
+        file = cache_fopen(path, truncated ? "wb" : "r+b"); assert(file);
+        fputc('X', file); assert(fclose(file) == 0);
+        free_stream(a);
+        a = open_cache(root, key, 1024 * 1024);
+        check_disjoint(a, 16384);
+        assert(read_cache(a, 0, 16384, 'A') == 16384);
+        free_stream(a); talloc_free(path); talloc_free(root);
+    }
+    talloc_free(key);
+    puts("overlapping writers publish only verified holes within the shared quota");
+}
+
 static void test_uncacheable(void)
 {
     for (int variant = 0; variant < 3; variant++) {
@@ -546,12 +633,25 @@ static void test_file_paths(void)
 int main(int argc, char **argv)
 {
     mp_time_init();
+    if (argc == 7 && !strcmp(argv[1], "--pending-write")) {
+        reset_input(); source = argv[3];
+        int start = atoi(argv[5]), length = atoi(argv[6]);
+        struct stream *s = open_cache(argv[2], argv[4], 1024 * 1024);
+        assert(read_cache(s, start, length, 'A') == length);
+        puts("ready"); fflush(stdout);
+        assert(getchar() == '\n');
+        free_stream(s);
+        return 0;
+    }
     if (argc == 6 && !strcmp(argv[1], "--offline-read")) {
         reset_input(); source = argv[3]; input.offline = true;
         int length = atoi(argv[5]);
         struct stream *s = open_cache(argv[2], argv[4], 1024 * 1024);
-        assert(stream_get_size(s) == length);
-        assert(read_cache(s, 0, length, 'A') == length);
+        assert(stream_get_size(s) >= length);
+        for (int offset = 0; offset < length;) {
+            int got = read_cache(s, offset, length - offset, 'A');
+            assert(got > 0); offset += got;
+        }
         assert(input.opens == 0);
         free_stream(s);
         puts("native cache read Dart bytes offline");
@@ -581,6 +681,7 @@ int main(int argc, char **argv)
     test_changes();
     test_corruption();
     test_quota_and_clear();
+    test_deduplication();
     test_uncacheable();
     test_initial_200();
     test_file_paths();

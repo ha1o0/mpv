@@ -1664,6 +1664,20 @@ static int mp_property_floe_cache_state(void *ctx, struct m_property *prop,
                : M_PROPERTY_UNAVAILABLE;
 }
 
+static int mp_property_demuxer_cache_time_map(void *ctx, struct m_property *prop,
+                                            int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (!mpctx->demuxer) return M_PROPERTY_UNAVAILABLE;
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_GET) return M_PROPERTY_NOT_IMPLEMENTED;
+    demux_get_cache_time_map(mpctx->demuxer, arg);
+    return M_PROPERTY_OK;
+}
+
 static int mp_property_demuxer_start_time(void *ctx, struct m_property *prop,
                                           int action, void *arg)
 {
@@ -4685,6 +4699,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-cache-idle", mp_property_demuxer_cache_idle},
     {"demuxer-start-time", mp_property_demuxer_start_time},
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
+    {"demuxer-cache-time-map", mp_property_demuxer_cache_time_map},
     {"floe-cache-state", mp_property_floe_cache_state},
     {"floe-cache-version", mp_property_floe_cache_version},
     {"cache-buffering-state", mp_property_cache_buffering},

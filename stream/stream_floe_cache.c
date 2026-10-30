@@ -41,11 +41,15 @@ enum cache_write_result { CACHE_WRITE_OK, CACHE_WRITE_BUSY, CACHE_WRITE_DISABLED
 struct cache_file {
     char *path;
     int64_t size, modified;
-    bool pending;
+    bool pending, retained;
 };
 struct cache_chunk {
     int64_t start, length;
     char version[65], checksum[65];
+};
+struct cache_span {
+    int64_t start, end;
+    char *path;
 };
 struct floe_cache_stream {
     struct stream *stream, *lower;
@@ -56,6 +60,7 @@ struct floe_cache_stream {
     char version[65], root_epoch[65], source_epoch[65];
     uint8_t *pending;
     int pending_length;
+    int64_t pending_since;
     uint8_t *read_buffer;
     char *read_path;
     int64_t read_start;
@@ -449,7 +454,8 @@ static bool owned_file(const char *name, bool legacy)
                 size > 0 && !strcmp(p, ".chunk");
         } else if (!legacy && hex_string(key, false)) {
             struct cache_chunk chunk;
-            ok = !strcmp(base + 64, ".meta") || parse_chunk(base, key, &chunk);
+            ok = !strcmp(base + 64, ".meta") || !strcmp(base + 64, ".timeline") ||
+                parse_chunk(base, key, &chunk);
         }
     }
     talloc_free(base);
@@ -533,8 +539,9 @@ static int64_t current_quota(struct floe_cache_stream *cache)
     return ok ? quota : missing ? cache->max_bytes : 0;
 }
 
-static bool make_room(struct floe_cache_stream *cache, int64_t extra,
-                       const char *protected_path)
+static bool make_room_except(struct floe_cache_stream *cache, int64_t extra,
+                             const char *protected_path,
+                             struct cache_span *protected, int num_protected)
 {
     int64_t limit = current_quota(cache);
     if (limit <= 0 || extra < 0 || extra > limit) return false;
@@ -551,11 +558,23 @@ static bool make_room(struct floe_cache_stream *cache, int64_t extra,
         if (files[i].size > INT64_MAX - total) ok = false;
         else total += files[i].size;
     }
+    int64_t retained = 0;
+    for (int i = 0; ok && i < count; i++) {
+        bool keep = protected_path && !strcmp(files[i].path, protected_path);
+        for (int j = 0; !keep && j < num_protected; j++)
+            keep = !strcmp(files[i].path, protected[j].path);
+        if (keep) {
+            retained += files[i].size;
+            files[i].retained = true;
+        }
+    }
+    // Do not evict unrelated data if the protected bytes alone cannot fit.
+    ok = ok && retained <= limit - extra;
     if (ok && total > limit - extra) {
         qsort(files, count, sizeof(*files), compare_modified);
         int64_t target = MPMAX(0, limit - extra - MPMIN(limit / 20, FLOE_CACHE_CHUNK_SIZE * 8));
         for (int i = 0; ok && i < count && total > target; i++) {
-            if (files[i].pending || (protected_path && !strcmp(files[i].path, protected_path))) continue;
+            if (files[i].pending || files[i].retained) continue;
             if (floe_cache_unlink(files[i].path) != 0) { ok = false; break; }
             total -= files[i].size;
         }
@@ -563,6 +582,12 @@ static bool make_room(struct floe_cache_stream *cache, int64_t extra,
     ok = ok && total <= limit - extra;
     talloc_free(ctx);
     return ok;
+}
+
+static bool make_room(struct floe_cache_stream *cache, int64_t extra,
+                      const char *protected_path)
+{
+    return make_room_except(cache, extra, protected_path, NULL, 0);
 }
 
 static char *metadata_path(void *ctx, struct floe_cache_stream *cache)
@@ -644,29 +669,80 @@ static bool register_metadata(struct floe_cache_stream *cache)
     return ok;
 }
 
+static int compare_span_start(const void *a, const void *b)
+{
+    const struct cache_span *left = a, *right = b;
+    return (left->start > right->start) - (left->start < right->start);
+}
+
 static enum cache_write_result write_chunk(struct floe_cache_stream *cache,
                                           int64_t start, const uint8_t *data, int size)
 {
     if (size <= 0 || size > FLOE_CACHE_CHUNK_SIZE || start < 0 ||
         start > cache->metadata.length - size) return CACHE_WRITE_DISABLED;
-    char checksum[65]; sha256(checksum, data, size);
     struct cache_lock lock;
     if (!root_lock_for_io(cache, &lock))
         return lock_busy() ? CACHE_WRITE_BUSY : CACHE_WRITE_DISABLED;
     void *ctx = talloc_new(NULL);
-    char *path = talloc_asprintf(ctx, "%s/%s.%s.%" PRId64 ".%d.%s.chunk",
-        cache->directory, cache->key, cache->version, start, size, checksum);
     char *meta = metadata_path(ctx, cache);
-    bool ok = valid_lease(cache) && current_version(cache);
-    struct stat st;
-    if (ok && floe_cache_lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == size) {
-        root_unlock(&lock); talloc_free(ctx); return CACHE_WRITE_OK;
+    bool ok = valid_lease(cache) && current_version(cache) &&
+        directory_exists(cache->directory, false);
+    int num_covered = 0, num_missing = 0;
+    struct cache_span *covered = NULL, *missing = NULL;
+    int64_t end = start + size;
+    DIR *dir = ok ? floe_cache_opendir(cache->directory) : NULL;
+    ok = ok && dir;
+    struct dirent *item;
+    while (ok && (item = readdir(dir))) {
+        struct cache_chunk chunk;
+        if (!parse_chunk(item->d_name, cache->key, &chunk) ||
+            strcmp(chunk.version, cache->version) || chunk.start >= end ||
+            chunk.start + chunk.length <= start ||
+            chunk.start + chunk.length > cache->metadata.length) continue;
+        char *path = mp_path_join(ctx, cache->directory, item->d_name);
+        int length = 0;
+        char *bytes = read_file(ctx, path, FLOE_CACHE_CHUNK_SIZE, &length);
+        char checksum[65] = {0};
+        if (bytes) sha256(checksum, bytes, length);
+        bool valid = bytes && length == chunk.length && !strcmp(checksum, chunk.checksum);
+        talloc_free(bytes);
+        if (!valid) {
+            // A corrupt published file is a hole, never deduplication evidence.
+            ok = floe_cache_unlink(path) == 0 || errno == ENOENT;
+            continue;
+        }
+        MP_TARRAY_APPEND(ctx, covered, num_covered, ((struct cache_span){
+            .start = chunk.start, .end = chunk.start + chunk.length, .path = path}));
     }
-    ok = ok && directory_exists(cache->directory, false) && make_room(cache, size, meta);
-    if (ok) {
-        ok = write_atomic(path, data, size);
-        if (ok) floe_cache_touch(meta);
+    if (dir) closedir(dir);
+    if (num_covered) qsort(covered, num_covered, sizeof(*covered), compare_span_start);
+    int64_t cursor = start, additional = 0;
+    for (int i = 0; i < num_covered; i++) {
+        if (covered[i].start > cursor) {
+            MP_TARRAY_APPEND(ctx, missing, num_missing, ((struct cache_span){
+                .start = cursor, .end = covered[i].start}));
+            additional += covered[i].start - cursor;
+        }
+        cursor = MPMAX(cursor, MPMIN(end, covered[i].end));
     }
+    if (cursor < end) {
+        MP_TARRAY_APPEND(ctx, missing, num_missing, ((struct cache_span){
+            .start = cursor, .end = end}));
+        additional += end - cursor;
+    }
+    // Coverage, quota reservation and publication share the cross-process lock.
+    // Eviction must preserve every byte we just subtracted from this write.
+    if (ok && additional)
+        ok = make_room_except(cache, additional, meta, covered, num_covered);
+    for (int i = 0; ok && i < num_missing; i++) {
+        int length = missing[i].end - missing[i].start;
+        const uint8_t *part = data + (missing[i].start - start);
+        char checksum[65]; sha256(checksum, part, length);
+        char *path = talloc_asprintf(ctx, "%s/%s.%s.%" PRId64 ".%d.%s.chunk",
+            cache->directory, cache->key, cache->version, missing[i].start, length, checksum);
+        ok = write_atomic(path, part, length);
+    }
+    if (ok && additional) floe_cache_touch(meta);
     talloc_free(ctx); root_unlock(&lock);
     return ok ? CACHE_WRITE_OK : CACHE_WRITE_DISABLED;
 }
@@ -691,7 +767,10 @@ static void record_bytes(struct floe_cache_stream *cache, int64_t start,
         start != cache->pending_start + cache->pending_length) flush_pending(cache);
     int used = 0;
     while (cache->publish && used < size) {
-        if (!cache->pending_length) cache->pending_start = start + used;
+        if (!cache->pending_length) {
+            cache->pending_start = start + used;
+            cache->pending_since = mp_time_ns();
+        }
         int count = MPMIN(FLOE_CACHE_CHUNK_SIZE - cache->pending_length, size - used);
         if (!cache->pending) cache->pending = talloc_size(cache, FLOE_CACHE_CHUNK_SIZE);
         memcpy(cache->pending + cache->pending_length, data + used, count);
@@ -699,6 +778,18 @@ static void record_bytes(struct floe_cache_stream *cache, int64_t start,
         if (cache->pending_length == FLOE_CACHE_CHUNK_SIZE) flush_pending(cache);
     }
     if (start + size == cache->metadata.length) flush_pending(cache);
+}
+
+bool stream_floe_cache_flush_due(struct stream *s)
+{
+    struct floe_cache_stream *cache = s ? s->floe_cache : NULL;
+    return cache && cache->publish && cache->pending_length &&
+        mp_time_ns() - cache->pending_since >= MP_TIME_S_TO_NS(3);
+}
+
+void stream_floe_cache_flush(struct stream *s)
+{
+    if (s && s->floe_cache) flush_pending(s->floe_cache);
 }
 
 static int read_cached(struct floe_cache_stream *cache, int64_t position,
@@ -984,6 +1075,7 @@ bool stream_floe_cache_get_state(struct stream *s, struct mpv_node *node)
     if (!root_lock(cache, &lock)) return false;
     node_init(node, MPV_FORMAT_NODE_MAP, NULL);
     node_map_add_string(node, "key", cache->key);
+    node_map_add_string(node, "version", cache->version);
     node_map_add_string(node, "directory", cache->directory);
     node_map_add_int64(node, "max-bytes", current_quota(cache));
     node_map_add_int64(node, "file-size", cache->metadata.length);
