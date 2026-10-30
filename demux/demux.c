@@ -4355,6 +4355,113 @@ static void update_cache(struct demux_internal *in)
         in->next_cache_update = now + MP_TIME_S_TO_NS(1) + MP_TIME_US_TO_NS(1);
 }
 
+struct demux_cache_snapshot {
+    struct sh_stream stream;
+    struct mp_codec_params codec;
+    struct demux_packet **packets;
+    int num_packets;
+    double base, target;
+};
+
+static void free_cache_snapshot(void *p)
+{
+    struct demux_cache_snapshot *s = p;
+    avcodec_parameters_free(&s->codec.lav_codecpar);
+}
+
+struct demux_cache_snapshot *demux_cache_snapshot_video(
+    struct demuxer *demuxer, struct sh_stream *stream, double target)
+{
+    struct demux_internal *in = demuxer->in;
+    struct demux_cache_snapshot *s = NULL;
+    mp_mutex_lock(&in->lock);
+    target = MP_ADD_PTS(target, -in->ts_offset);
+    if (!stream || stream->type != STREAM_VIDEO || stream->image ||
+        stream->group || !isfinite(target) || target == MP_NOPTS_VALUE)
+        goto done;
+    int index = stream->index;
+    if (index < 0 || index >= in->num_streams || in->streams[index] != stream)
+        goto done;
+    struct demux_cached_range *r = find_cache_seek_range(in, target, 0);
+    if (!r || index >= r->num_streams)
+        goto done;
+    struct demux_packet *first = find_seek_target(r->streams[index], target, 0);
+    if (!first || !first->keyframe || first->pts == MP_NOPTS_VALUE ||
+        first->pts > target || target - first->pts > 60)
+        goto done;
+
+    s = talloc_zero(NULL, struct demux_cache_snapshot);
+    talloc_set_destructor(s, free_cache_snapshot);
+    s->codec = (struct mp_codec_params){
+        .type = STREAM_VIDEO,
+        .lav_codecpar = mp_codec_params_to_av(stream->codec),
+        .native_tb_num = stream->codec->native_tb_num,
+        .native_tb_den = stream->codec->native_tb_den,
+    };
+    s->stream = (struct sh_stream){.type = STREAM_VIDEO, .codec = &s->codec};
+    s->base = first->pts;
+    s->target = target;
+    size_t bytes = 0;
+    double last = MP_NOPTS_VALUE;
+    for (struct demux_packet *dp = first; dp; dp = dp->next) {
+        // Clone just the GOP needed by an independent decoder. These bounds
+        // cap transient work under the demux lock, not persistent cache size.
+        if (s->num_packets >= 4096 || dp->segmented || dp->is_wrapped_avframe)
+            goto fail;
+        if (dp != first && dp->keyframe && dp->pts > target + 0.1)
+            break;
+        struct demux_packet *copy = read_packet_from_cache(in, dp);
+        if (!copy)
+            goto fail;
+        // Native MKV packets can omit DTS even with AVCodecParameters present.
+        // Give the muxer the recorder's conservative reordering window rather
+        // than letting it treat nonmonotonic B-frame PTS as decoding times.
+        if (copy->dts == MP_NOPTS_VALUE && s->codec.lav_codecpar)
+            s->codec.lav_codecpar->video_delay = 16;
+        talloc_steal(s, copy);
+        if (copy->len > 32 * 1024 * 1024 - bytes)
+            goto fail;
+        MP_TARRAY_APPEND(s, s->packets, s->num_packets, copy);
+        bytes += copy->len;
+        s->base = MP_PTS_MIN(s->base, dp->pts);
+        last = MP_PTS_MAX(last, dp->pts);
+    }
+    if (!s->codec.lav_codecpar || last == MP_NOPTS_VALUE || last < target)
+        goto fail;
+    goto done;
+fail:
+    TA_FREEP(&s);
+done:
+    mp_mutex_unlock(&in->lock);
+    return s;
+}
+
+bool demux_cache_snapshot_write(struct demux_cache_snapshot *s,
+                               struct mpv_global *global, const char *file)
+{
+    struct sh_stream *streams[] = {&s->stream};
+    struct mp_recorder *recorder = mp_recorder_create(global, file, streams, 1,
+                                                     NULL, 0);
+    if (!recorder)
+        return false;
+    mp_recorder_set_timestamp_base(recorder, s->base);
+    struct mp_recorder_sink *sink = mp_recorder_get_sink(recorder, &s->stream);
+    for (int n = 0; n < s->num_packets; n++)
+        mp_recorder_feed_packet(sink, s->packets[n]);
+    mp_recorder_feed_packet(sink, NULL);
+    if (!mp_recorder_destroy(recorder))
+        return false;
+    // Publish timing only after the finite clip has closed. This avoids a
+    // shared mutable "last snapshot" property when two callers overlap.
+    char *info = talloc_asprintf(NULL, "%s.json", file);
+    FILE *out = fopen(info, "wb");
+    talloc_free(info);
+    if (!out)
+        return false;
+    bool ok = fprintf(out, "{\"position\":%.9f}\n", s->target - s->base) > 0;
+    return fclose(out) == 0 && ok;
+}
+
 static void dumper_close(struct demux_internal *in)
 {
     if (in->dumper)

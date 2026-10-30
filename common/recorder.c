@@ -51,6 +51,7 @@ struct mp_recorder {
     bool muxing;            // we're currently recording (instead of preparing)
     bool muxing_from_start; // no discontinuity at start
     bool dts_warning;
+    bool failed;
 
     // The start timestamp of the currently recorded segment (the timestamp of
     // the first packet of the incoming packet stream).
@@ -237,6 +238,13 @@ static void flush_packets(struct mp_recorder *priv)
     }
 }
 
+void mp_recorder_set_timestamp_base(struct mp_recorder *priv, double base)
+{
+    priv->base_ts = base;
+    priv->rebase_ts = 0;
+    priv->muxing = true;
+}
+
 static void mux_packet(struct mp_recorder_sink *rst,
                        struct demux_packet *pkt)
 {
@@ -259,11 +267,14 @@ static void mux_packet(struct mp_recorder_sink *rst,
     AVPacket *new_packet = av_packet_clone(rst->avpkt);
     if (!new_packet) {
         MP_ERR(priv, "Failed to allocate packet.\n");
+        priv->failed = true;
         return;
     }
 
-    if (av_interleaved_write_frame(priv->mux, new_packet) < 0)
+    if (av_interleaved_write_frame(priv->mux, new_packet) < 0) {
         MP_ERR(priv, "Failed writing packet.\n");
+        priv->failed = true;
+    }
 
     av_packet_free(&new_packet);
 }
@@ -326,7 +337,7 @@ static void check_restart(struct mp_recorder *priv)
         MP_WARN(priv, "Discontinuity at timestamp %f.\n", priv->rebase_ts);
 }
 
-void mp_recorder_destroy(struct mp_recorder *priv)
+bool mp_recorder_destroy(struct mp_recorder *priv)
 {
     if (priv->opened) {
         for (int n = 0; n < priv->num_streams; n++) {
@@ -335,19 +346,25 @@ void mp_recorder_destroy(struct mp_recorder *priv)
             mp_free_av_packet(&rst->avpkt);
         }
 
-        if (av_write_trailer(priv->mux) < 0)
+        if (av_write_trailer(priv->mux) < 0) {
             MP_ERR(priv, "Writing trailer failed.\n");
+            priv->failed = true;
+        }
     }
 
     if (priv->mux) {
-        if (avio_closep(&priv->mux->pb) < 0)
+        if (avio_closep(&priv->mux->pb) < 0) {
             MP_ERR(priv, "Closing file failed\n");
+            priv->failed = true;
+        }
 
         avformat_free_context(priv->mux);
     }
 
     flush_packets(priv);
+    bool ok = priv->opened && !priv->failed;
     talloc_free(priv);
+    return ok;
 }
 
 // This is called on a seek, or when recording was started mid-stream.

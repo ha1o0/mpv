@@ -7412,6 +7412,29 @@ static void cmd_dump_cache(void *p)
     run_dump_cmd(cmd, cmd->args[0].v.d, cmd->args[1].v.d, cmd->args[2].v.s);
 }
 
+static void cmd_floe_cache_snapshot(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    struct demux_cache_snapshot *snapshot = track && track->demuxer
+        ? demux_cache_snapshot_video(track->demuxer, track->stream,
+                                     cmd->args[0].v.d)
+        : NULL;
+    cmd->success = false;
+    if (!snapshot)
+        return;
+    char *path = mp_get_user_path(NULL, mpctx->global, cmd->args[1].v.s);
+    // All packets and codec parameters are owned by the snapshot. Neither
+    // filesystem I/O nor muxing holds the core/demux lock or moves a reader.
+    mp_core_unlock(mpctx);
+    bool ok = demux_cache_snapshot_write(snapshot, mpctx->global, path);
+    talloc_free(snapshot);
+    talloc_free(path);
+    mp_core_lock(mpctx);
+    cmd->success = ok;
+}
+
 static void cmd_dump_cache_ab(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -7980,6 +8003,11 @@ const struct mp_cmd_def mp_cmds[] = {
     { "load-input-conf", cmd_load_input_conf, {{"filename", OPT_STRING(v.s)}} },
 
     { "load-script", cmd_load_script, {{"filename", OPT_STRING(v.s)}} },
+
+    { "floe-cache-snapshot", cmd_floe_cache_snapshot,
+        { {"time", OPT_TIME(v.d)}, {"filename", OPT_STRING(v.s)} },
+        .spawn_thread = true,
+    },
 
     { "dump-cache", cmd_dump_cache, { {"start", OPT_TIME(v.d),
                                         .flags = M_OPT_ALLOW_NO},

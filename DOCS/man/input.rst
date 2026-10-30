@@ -1669,6 +1669,26 @@ Miscellaneous Commands
     unseekable streams that are going out of sync.
     This command might be changed or removed in the future.
 
+``floe-cache-snapshot <time> <filename>``
+    Copy a finite, independently decodable segment around ``<time>`` from the
+    selected video track's existing demux cache into a local NUT file. Time is
+    in playback seconds. This does not seek, move playback readers, read the
+    source stream, or change an ongoing ``dump-cache`` operation. The filename
+    must end in ``.nut`` and should be unique to the caller.
+
+    Packet references and codec parameters are copied under the demux lock;
+    muxing and file I/O run outside the core and demux locks. The command fails
+    if a suitable cached keyframe/target is unavailable or the bounded snapshot
+    exceeds 4096 packets, 32 MiB, or 60 seconds of keyframe preroll. These bounds
+    limit temporary preview work, not persistent coverage or time indexes.
+
+    After the clip closes, ``<filename>.json`` contains ``position``: the
+    requested timestamp relative to the clip's timestamp origin, in seconds.
+    Decode that position with normal start-time rebasing. Callers must wait for
+    command completion before reading or removing either file, and remove both
+    files after use. Unsupported/partial cached streams may fail to decode;
+    consumers requiring local-only previews must not fetch missing source data.
+
 ``dump-cache <start> <end> <filename>``
     Dump the current cache to the given filename. The ``<filename>`` file is
     overwritten if it already exists. ``<start>`` and ``<end>`` give the

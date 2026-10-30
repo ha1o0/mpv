@@ -355,6 +355,12 @@ void demux_update(demuxer_t *demuxer, double playback_pts);
 
 bool demux_cache_dump_set(struct demuxer *demuxer, double start, double end,
                           char *file);
+struct demux_cache_snapshot;
+// Clone a bounded selected-video GOP without moving any playback reader.
+struct demux_cache_snapshot *demux_cache_snapshot_video(
+    struct demuxer *demuxer, struct sh_stream *stream, double target);
+bool demux_cache_snapshot_write(struct demux_cache_snapshot *snapshot,
+                               struct mpv_global *global, const char *file);
 int demux_cache_dump_get_status(struct demuxer *demuxer);
 
 double demux_probe_cache_dump_target(struct demuxer *demuxer, double pts,
