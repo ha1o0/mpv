@@ -51,6 +51,14 @@ struct cache_span {
     int64_t start, end;
     char *path;
 };
+struct deferred_chunk {
+    struct deferred_chunk *next;
+    uint8_t *data;
+    int64_t start;
+    int size;
+};
+#define MAX_DEFERRED_CHUNKS 8
+#define DEFERRED_RETRY_NS (100 * 1000 * 1000)
 struct floe_cache_stream {
     struct stream *stream, *lower;
     struct floe_cache_curl_session *http;
@@ -61,11 +69,15 @@ struct floe_cache_stream {
     uint8_t *pending;
     int pending_length;
     int64_t pending_since;
+    struct deferred_chunk *deferred, *deferred_tail;
+    int deferred_count;
+    int64_t retry_after;
+    bool deferred_overflow_warned;
     uint8_t *read_buffer;
     char *read_path;
     int64_t read_start;
     int read_length;
-    bool publish, failed;
+    bool publish, failed, metadata_pending;
 };
 
 static mp_mutex floe_cache_lock = MP_STATIC_MUTEX_INITIALIZER;
@@ -633,17 +645,18 @@ static void invalidate(struct floe_cache_stream *cache)
     cache->pending_length = 0;
 }
 
-static bool register_metadata(struct floe_cache_stream *cache)
+static enum cache_write_result register_metadata(struct floe_cache_stream *cache)
 {
     struct cache_lock lock;
-    if (!root_lock_for_io(cache, &lock)) return false;
+    if (!root_lock_for_io(cache, &lock))
+        return lock_busy() ? CACHE_WRITE_BUSY : CACHE_WRITE_DISABLED;
     bool ok = valid_lease(cache);
     struct floe_cache_http_response existing;
     if (ok && load_metadata(cache, &existing)) {
         char version[65]; content_version(version, &existing);
         ok = !strcmp(version, cache->version);
         root_unlock(&lock);
-        return ok;
+        return ok ? CACHE_WRITE_OK : CACHE_WRITE_DISABLED;
     }
     void *ctx = talloc_new(NULL);
     struct mpv_node node;
@@ -666,7 +679,7 @@ static bool register_metadata(struct floe_cache_stream *cache)
     }
     talloc_free(node.u.list); talloc_free(json); talloc_free(ctx);
     root_unlock(&lock);
-    return ok;
+    return ok ? CACHE_WRITE_OK : CACHE_WRITE_DISABLED;
 }
 
 static int compare_span_start(const void *a, const void *b)
@@ -680,6 +693,11 @@ static enum cache_write_result write_chunk(struct floe_cache_stream *cache,
 {
     if (size <= 0 || size > FLOE_CACHE_CHUNK_SIZE || start < 0 ||
         start > cache->metadata.length - size) return CACHE_WRITE_DISABLED;
+    if (cache->metadata_pending) {
+        enum cache_write_result result = register_metadata(cache);
+        if (result != CACHE_WRITE_OK) return result;
+        cache->metadata_pending = false;
+    }
     struct cache_lock lock;
     if (!root_lock_for_io(cache, &lock))
         return lock_busy() ? CACHE_WRITE_BUSY : CACHE_WRITE_DISABLED;
@@ -747,14 +765,75 @@ static enum cache_write_result write_chunk(struct floe_cache_stream *cache,
     return ok ? CACHE_WRITE_OK : CACHE_WRITE_DISABLED;
 }
 
+static void discard_deferred(struct floe_cache_stream *cache)
+{
+    while (cache->deferred) {
+        struct deferred_chunk *chunk = cache->deferred;
+        cache->deferred = chunk->next;
+        talloc_free(chunk);
+    }
+    cache->deferred_tail = NULL;
+    cache->deferred_count = 0;
+}
+
+static void drain_deferred(struct floe_cache_stream *cache)
+{
+    if (!cache->publish) { discard_deferred(cache); return; }
+    while (cache->deferred) {
+        struct deferred_chunk *chunk = cache->deferred;
+        enum cache_write_result result = write_chunk(cache, chunk->start,
+                                                     chunk->data, chunk->size);
+        if (result == CACHE_WRITE_BUSY) {
+            cache->retry_after = mp_time_ns() + DEFERRED_RETRY_NS;
+            return;
+        }
+        if (result == CACHE_WRITE_DISABLED) {
+            cache->publish = false;
+            cache->pending_length = 0;
+            discard_deferred(cache);
+            return;
+        }
+        cache->deferred = chunk->next;
+        cache->deferred_count--;
+        talloc_free(chunk);
+    }
+    cache->deferred_tail = NULL;
+}
+
 static void flush_pending(struct floe_cache_stream *cache)
 {
-    // An extended lock conflict can skip this optional fragment while later
-    // fragments still publish. I/O errors and a revoked lease stop publication.
-    if (cache->publish && cache->pending_length &&
-        write_chunk(cache, cache->pending_start, cache->pending, cache->pending_length)
-            == CACHE_WRITE_DISABLED)
+    if (mp_time_ns() >= cache->retry_after) drain_deferred(cache);
+    if (!cache->publish || !cache->pending_length) {
+        cache->pending_length = 0;
+        return;
+    }
+    enum cache_write_result result = cache->deferred ? CACHE_WRITE_BUSY :
+        write_chunk(cache, cache->pending_start, cache->pending, cache->pending_length);
+    if (result == CACHE_WRITE_BUSY) {
+        if (!cache->deferred)
+            cache->retry_after = mp_time_ns() + DEFERRED_RETRY_NS;
+        // Retain the exact received bytes across reads, seeks and idle periods.
+        // Every retry still validates the original clear lease/content version.
+        if (cache->deferred_count < MAX_DEFERRED_CHUNKS) {
+            struct deferred_chunk *chunk = talloc_zero(cache, struct deferred_chunk);
+            chunk->data = talloc_steal(chunk, cache->pending);
+            chunk->start = cache->pending_start;
+            chunk->size = cache->pending_length;
+            if (cache->deferred_tail) cache->deferred_tail->next = chunk;
+            else cache->deferred = chunk;
+            cache->deferred_tail = chunk;
+            cache->deferred_count++;
+            cache->pending = NULL;
+        } else if (!cache->deferred_overflow_warned) {
+            // Persistence is optional during an indefinitely unavailable disk.
+            // Bound memory instead of blocking playback or growing without limit.
+            MP_WARN(cache->stream, "Disk cache retry queue full; skipping new fragments.\n");
+            cache->deferred_overflow_warned = true;
+        }
+    } else if (result == CACHE_WRITE_DISABLED) {
         cache->publish = false;
+        discard_deferred(cache);
+    }
     cache->pending_length = 0;
 }
 
@@ -783,8 +862,10 @@ static void record_bytes(struct floe_cache_stream *cache, int64_t start,
 bool stream_floe_cache_flush_due(struct stream *s)
 {
     struct floe_cache_stream *cache = s ? s->floe_cache : NULL;
-    return cache && cache->publish && cache->pending_length &&
-        mp_time_ns() - cache->pending_since >= MP_TIME_S_TO_NS(3);
+    return cache && cache->publish &&
+        ((cache->deferred && mp_time_ns() >= cache->retry_after) ||
+         (cache->pending_length &&
+          mp_time_ns() - cache->pending_since >= MP_TIME_S_TO_NS(3)));
 }
 
 void stream_floe_cache_flush(struct stream *s)
@@ -904,7 +985,9 @@ static bool open_lower(struct floe_cache_stream *cache, int64_t position,
         cache->metadata = response;
         if (response.cacheable) {
             content_version(cache->version, &response);
-            cache->publish = register_metadata(cache);
+            enum cache_write_result result = register_metadata(cache);
+            cache->publish = result != CACHE_WRITE_DISABLED;
+            cache->metadata_pending = result == CACHE_WRITE_BUSY;
         }
     }
     cache->lower_end = cache->lower->seekable ? response.end : 0;
@@ -928,6 +1011,8 @@ static int cache_fill_buffer(struct stream *s, void *buffer, int maximum)
 {
     struct floe_cache_stream *cache = s->floe_cache;
     if (cache->failed || maximum <= 0) return 0;
+    if (cache->deferred && mp_time_ns() >= cache->retry_after)
+        drain_deferred(cache);
     // Uncacheable streams retain the ordinary reader's request continuation,
     // decompression, metadata and cookies for their entire lifetime.
     if (!cache->metadata.cacheable)
@@ -979,19 +1064,33 @@ static int cache_control(struct stream *s, int command, void *arg)
     return cache->lower ? stream_control(cache->lower, command, arg) : STREAM_UNSUPPORTED;
 }
 
+static void finish_cache(struct floe_cache_stream *cache)
+{
+    close_lower(cache);
+    const int64_t deadline = mp_time_ns() + MP_TIME_S_TO_NS(1);
+    while (cache->deferred) {
+        drain_deferred(cache);
+        if (!cache->deferred || mp_cancel_test(cache->stream->cancel) ||
+            mp_time_ns() >= deadline) break;
+        mp_sleep_ns(DEFERRED_RETRY_NS);
+    }
+    discard_deferred(cache);
+}
+
 static void cache_close(struct stream *s)
 {
-    close_lower(s->floe_cache);
+    finish_cache(s->floe_cache);
 }
 
 static void cache_destructor(void *arg)
 {
-    close_lower(arg);
+    finish_cache(arg);
 }
 
 int stream_floe_cache_version(void)
 {
-    return HAVE_LIBCURL ? 2 : 0;
+    // v3 retains v2's disk format and adds bounded retries of received bytes.
+    return HAVE_LIBCURL ? 3 : 0;
 }
 
 int stream_floe_cache_open(struct stream *s, struct stream_open_args *args,

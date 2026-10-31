@@ -39,6 +39,9 @@ struct lower {
     char fill;
 };
 static struct input input;
+static const char *registration_lock_root;
+static int registration_guard = -1;
+static int hold_cache_guard(const char *root);
 static char *base;
 static const char *source = "12345678-1234-1234-1234-123456789abc";
 static const char *url = "https://origin/movie.mp4";
@@ -127,6 +130,10 @@ int stream_curl_floe_cache_open(struct stream *parent, int64_t start, int64_t en
     s->priv = lower; s->pos = start; s->seekable = true;
     s->get_size = lower_size; s->control = lower_control;
     *out = s;
+    if (registration_lock_root) {
+        registration_guard = hold_cache_guard(registration_lock_root);
+        registration_lock_root = NULL;
+    }
     return STREAM_OK;
 }
 
@@ -333,6 +340,71 @@ static void test_lock_contention(void)
     assert(input.opens == 0); free_stream(s);
     talloc_free(path); talloc_free(root); talloc_free(key);
     puts("short management lock contention preserves publication and offline hits");
+}
+
+static int hold_cache_guard(const char *root)
+{
+    char *path = mp_path_join(NULL, root, ".lock-v2");
+    int fd = floe_cache_open(path, O_RDWR | O_BINARY, 0);
+    talloc_free(path);
+    assert(fd >= 0);
+#ifdef _WIN32
+    OVERLAPPED position = {0};
+    assert(LockFileEx((HANDLE)_get_osfhandle(fd), LOCKFILE_EXCLUSIVE_LOCK |
+        LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &position));
+#else
+    assert(flock(fd, LOCK_EX | LOCK_NB) == 0);
+#endif
+    return fd;
+}
+
+static void test_deferred_publication(void)
+{
+    // Real OS locks stay held beyond the I/O retry budget. No network reread
+    // should be necessary to publish the received bytes after the lock clears.
+    for (int mode = 0; mode < 5; mode++) {
+        reset_input();
+        input.length = 3 * FLOE_CACHE_CHUNK_SIZE;
+        char *name = talloc_asprintf(NULL, "deferred-%d", mode);
+        char *root = mp_path_join(NULL, base, name), *key = key_for("movie");
+        if (mode == 4) registration_lock_root = root;
+        struct stream *s = open_cache(root, key, 64 * 1024 * 1024);
+        int guard = mode == 4 ? registration_guard : hold_cache_guard(root);
+        for (int i = 0; i < 2; i++)
+            assert(read_cache(s, i * FLOE_CACHE_CHUNK_SIZE, FLOE_CACHE_CHUNK_SIZE, 'A')
+                == FLOE_CACHE_CHUNK_SIZE);
+        if (mode != 4) assert(!chunk_file(root, key));
+        assert(close(guard) == 0);
+        if (mode == 2) clear_media(root, key);
+        if (mode == 3) {
+            // Normal close also drains deferred bytes without an extra read.
+            free_stream(s);
+            s = NULL;
+        } else {
+            mp_sleep_ns(110 * 1000 * 1000);
+            assert(stream_floe_cache_flush_due(s));
+            if (mode == 1) {
+                assert(read_cache(s, 2 * FLOE_CACHE_CHUNK_SIZE, FLOE_CACHE_CHUNK_SIZE, 'A')
+                    == FLOE_CACHE_CHUNK_SIZE);
+            } else {
+                stream_floe_cache_flush(s);
+            }
+            free_stream(s);
+        }
+        if (mode == 2) {
+            assert(!chunk_file(root, key));
+        } else {
+            input.offline = true; input.opens = 0;
+            s = open_cache(root, key, 64 * 1024 * 1024);
+            for (int i = 0; i < (mode == 1 ? 3 : 2); i++)
+                assert(read_cache(s, i * FLOE_CACHE_CHUNK_SIZE, FLOE_CACHE_CHUNK_SIZE, 'A')
+                    == FLOE_CACHE_CHUNK_SIZE);
+            assert(input.opens == 0);
+            free_stream(s);
+        }
+        talloc_free(name); talloc_free(root); talloc_free(key);
+    }
+    puts("deferred fragments survive contention, idle, continued reads and close; clear revokes them");
 }
 
 static void test_changes(void)
@@ -632,6 +704,7 @@ static void test_file_paths(void)
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
     mp_time_init();
     if (argc == 7 && !strcmp(argv[1], "--pending-write")) {
         reset_input(); source = argv[3];
@@ -678,6 +751,7 @@ int main(int argc, char **argv)
     test_bypass();
     test_offline_and_related();
     test_lock_contention();
+    test_deferred_publication();
     test_changes();
     test_corruption();
     test_quota_and_clear();
