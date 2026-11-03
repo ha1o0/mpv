@@ -114,6 +114,20 @@ static void test_options_and_properties(void)
         fail("Node: expected 1 but got %d'!\n", result_node.u.flag);
 }
 
+static void test_secondary_subtitle_scale(void)
+{
+    check_double("secondary-sub-scale", -1.0);
+    set_property_string("sub-scale", "1.5");
+    check_double("secondary-sub-scale", -1.0);
+    set_property_string("secondary-sub-scale", "2.0");
+    check_double("secondary-sub-scale", 2.0);
+    check_double("sub-scale", 1.5);
+    set_property_string("sub-scale", "0.5");
+    check_double("secondary-sub-scale", 2.0);
+    set_property_string("secondary-sub-scale", "-1");
+    set_property_string("sub-scale", "1");
+}
+
 int main(int argc, char *argv[])
 {
     if (argc != 1)
@@ -130,6 +144,8 @@ int main(int argc, char *argv[])
     const char *fmt = "================ TEST: %s ================\n";
     printf(fmt, "test_options_and_properties");
     test_options_and_properties();
+    printf(fmt, "test_secondary_subtitle_scale");
+    test_secondary_subtitle_scale();
     printf("================ SHUTDOWN ================\n");
 
     command_string("quit");

@@ -2518,6 +2518,13 @@ Subtitles
         This affects ASS subtitles as well, and may lead to incorrect subtitle
         rendering. Use with care, or use ``--sub-font-size`` instead.
 
+``--secondary-sub-scale=<-1-100>``
+    Override the text subtitle font size factor for secondary subtitles.
+    Negative values (default: -1) inherit ``--sub-scale`` and preserve its
+    existing behavior. Nonnegative values select an independent factor and
+    do not change primary subtitles. The same ASS override and typesetting
+    rules as ``--sub-scale`` apply. Bitmap subtitles are unaffected.
+
 ``--sub-scale-signs=<yes|no>``
     When set to yes, also apply ``--sub-scale`` to typesetting (or "signs").
     When this is set to no, ``--sub-scale`` is only applied to dialogue. The

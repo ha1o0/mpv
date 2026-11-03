@@ -24,10 +24,30 @@ import ctypes as C
 import json
 import os
 from pathlib import Path
-import struct
 import tempfile
 import time
-import zlib
+
+
+class Node(C.Structure):
+    pass
+
+
+class NodeList(C.Structure):
+    _fields_ = [('num', C.c_int), ('values', C.POINTER(Node)),
+                ('keys', C.POINTER(C.c_char_p))]
+
+
+class ByteArray(C.Structure):
+    _fields_ = [('data', C.c_void_p), ('size', C.c_size_t)]
+
+
+class NodeValue(C.Union):
+    _fields_ = [('string', C.c_char_p), ('flag', C.c_int),
+                ('int64', C.c_int64), ('double', C.c_double),
+                ('list', C.POINTER(NodeList)), ('bytes', C.POINTER(ByteArray))]
+
+
+Node._fields_ = [('u', NodeValue), ('format', C.c_int)]
 
 
 class Event(C.Structure):
@@ -46,6 +66,8 @@ class Player:
             'mpv_get_property_string': ([C.c_void_p, C.c_char_p], C.c_void_p),
             'mpv_free': ([C.c_void_p], None),
             'mpv_command': ([C.c_void_p, C.POINTER(C.c_char_p)], C.c_int),
+            'mpv_command_ret': ([C.c_void_p, C.POINTER(C.c_char_p), C.POINTER(Node)], C.c_int),
+            'mpv_free_node_contents': ([C.POINTER(Node)], None),
             'mpv_wait_event': ([C.c_void_p, C.c_double], C.POINTER(Event)),
             'mpv_terminate_destroy': ([C.c_void_p], None),
         }
@@ -60,7 +82,9 @@ class Player:
                     'demuxer-max-bytes': '8388608', 'demuxer-max-back-bytes': '8388608'}
         try:
             for name, value in {**defaults, **options}.items():
-                assert self.lib.mpv_set_option_string(self.handle, name.encode(), value.encode()) >= 0, name
+                result = self.lib.mpv_set_option_string(self.handle, name.encode(), value.encode())
+                # Player-only builds can omit Lua/JavaScript and this option.
+                assert result >= 0 or (name == 'load-scripts' and result == -5), name
             assert self.lib.mpv_initialize(self.handle) >= 0
         except BaseException:
             self.close()
@@ -114,27 +138,39 @@ class Player:
                 memory['seekable-ranges'], memory['debug-low-level-seeks'],
                 memory['debug-byte-level-seeks'])
 
+    def pixels(self):
+        # The macOS video/full player has no PNG encoder. Compare raw pixels
+        # so cache preview tests exercise the same builds shipped to the app.
+        args = (C.c_char_p * 3)(b'screenshot-raw', b'video', None)
+        node = Node()
+        try:
+            result = self.lib.mpv_command_ret(self.handle, args, C.byref(node))
+            assert result >= 0, ('screenshot-raw', result)
+            assert node.format == 8  # MPV_FORMAT_NODE_MAP
+            entries = node.u.list.contents
+            fields = {entries.keys[n].decode(): entries.values[n]
+                      for n in range(entries.num)}
+            width, height, stride = (fields[name].u.int64 for name in ('w', 'h', 'stride'))
+            assert fields['format'].u.string == b'bgr0'
+            assert fields['data'].format == 9  # MPV_FORMAT_BYTE_ARRAY
+            data = fields['data'].u.bytes.contents
+            assert width > 0 and height > 0 and stride >= width * 4
+            assert data.size >= (height - 1) * stride + width * 4
+            raw = C.string_at(data.data, data.size)
+            # Ignore row padding and the undefined fourth byte in bgr0.
+            pixels = bytearray()
+            for y in range(height):
+                row = raw[y * stride:y * stride + width * 4]
+                for x in range(width):
+                    pixels.extend(row[x * 4:x * 4 + 3])
+            return width, height, bytes(pixels)
+        finally:
+            self.lib.mpv_free_node_contents(C.byref(node))
+
     def close(self):
         self.lib.mpv_terminate_destroy(self.handle)
         if self.dll_directory:
             self.dll_directory.close()
-
-
-def pixels(path):
-    data = path.read_bytes()
-    assert data[:8] == b'\x89PNG\r\n\x1a\n'
-    offset, header, compressed = 8, None, bytearray()
-    while offset + 12 <= len(data):
-        length = struct.unpack_from('>I', data, offset)[0]
-        kind = data[offset + 4:offset + 8]
-        body = data[offset + 8:offset + 8 + length]
-        if kind == b'IHDR':
-            header = body
-        if kind == b'IDAT':
-            compressed.extend(body)
-        offset += length + 12
-    assert header and compressed
-    return header, zlib.decompress(compressed)
 
 
 def verify(library, fixture, root):
@@ -157,10 +193,7 @@ def verify(library, fixture, root):
                         preview.frame('loadfile', str(clip))
                         preview.frame('seek', str(timing['position']), 'absolute+exact')
                         reference.frame('seek', str(target), 'absolute+exact')
-                        actual, expected = root / 'actual.png', root / 'expected.png'
-                        preview.command('screenshot-to-file', str(actual), 'video')
-                        reference.command('screenshot-to-file', str(expected), 'video')
-                        assert pixels(actual) == pixels(expected), (on_disk, target, timing)
+                        assert preview.pixels() == reference.pixels(), (on_disk, target, timing)
                         assert primary.state() == before, 'preview changed playback/cache readers'
                     finally:
                         preview.close()

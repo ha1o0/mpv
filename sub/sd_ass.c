@@ -555,7 +555,8 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
         set_hinting = opts->sub_hinting;
     }
     if (total_override || shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE) {
-        set_font_scale = opts->sub_scale;
+        set_font_scale = sd->order == 1 && opts->secondary_sub_scale >= 0
+            ? opts->secondary_sub_scale : opts->sub_scale;
     }
     if (set_scale_with_window) {
         set_font_scale *= dim->h / MPMAX(get_libass_scale_height(dim, set_use_margins), 1);
