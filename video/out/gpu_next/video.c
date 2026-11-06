@@ -585,9 +585,6 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
 
     frame->overlays = state->overlays;
     m_config_cache_update(p->next_opts_cache);
-    int sub_hdr_peak = gpu_next_get_sub_hdr_peak(p->next_opts_cache);
-    int image_subs_hdr_peak =
-        gpu_next_get_image_subs_hdr_peak(p->next_opts_cache);
     int image_subs_colorspace =
         gpu_next_get_image_subs_colorspace(p->next_opts_cache);
 
@@ -597,6 +594,9 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
         if (!item->num_parts || !item->packed)
             continue;
 
+        bool secondary = osd_is_secondary_subtitle(item);
+        int sub_hdr_peak = gpu_next_get_sub_hdr_peak(p->next_opts_cache, secondary);
+        int image_subs_hdr_peak = gpu_next_get_image_subs_hdr_peak(p->next_opts_cache, secondary);
         struct pl_video_osd_entry *entry = &state->entries[item->render_index];
         pl_fmt tex_fmt = p->osd_fmt[item->format];
 

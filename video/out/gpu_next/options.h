@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 struct m_config_cache;
 struct m_sub_options;
 
@@ -13,6 +15,6 @@ enum gpu_next_image_subs_colorspace {
 extern const struct m_sub_options gl_next_conf;
 
 // Keep the private gl_next_opts layout confined to vo_gpu_next.c.
-int gpu_next_get_sub_hdr_peak(const struct m_config_cache *cache);
-int gpu_next_get_image_subs_hdr_peak(const struct m_config_cache *cache);
+int gpu_next_get_sub_hdr_peak(const struct m_config_cache *cache, bool secondary);
+int gpu_next_get_image_subs_hdr_peak(const struct m_config_cache *cache, bool secondary);
 int gpu_next_get_image_subs_colorspace(const struct m_config_cache *cache);

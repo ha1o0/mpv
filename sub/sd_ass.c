@@ -112,13 +112,32 @@ static const struct sd_filter_functions *const filters[] = {
     NULL,
 };
 
+// Secondary styling is opt-in so existing libmpv clients retain shared styles.
+static bool independent_style(struct sd *sd)
+{
+    return sd->order == 1 && sd->opts->secondary_sub_style_independent;
+}
+
+static struct osd_style_opts *subtitle_style(struct sd *sd)
+{
+    return independent_style(sd) ? sd->opts->secondary_sub_style : sd->opts->sub_style;
+}
+
+static char **subtitle_style_overrides(struct sd *sd)
+{
+    return independent_style(sd) ? sd->opts->secondary_ass_style_override_list
+                                 : sd->opts->ass_style_override_list;
+}
+
 // Add default styles, if the track does not have any styles yet.
 // Apply style overrides if the user provides any.
 static void mp_ass_add_default_styles(struct sd *sd, ASS_Track *track, struct mp_subtitle_opts *opts,
                                       struct mp_subtitle_shared_opts *shared_opts)
 {
-    if (opts->ass_styles_file && shared_opts->ass_style_override[sd->order]) {
-        char *file = mp_get_user_path(NULL, sd->global, opts->ass_styles_file);
+    const char *styles_file = independent_style(sd)
+        ? opts->secondary_ass_styles_file : opts->ass_styles_file;
+    if (styles_file && shared_opts->ass_style_override[sd->order]) {
+        char *file = mp_get_user_path(NULL, sd->global, styles_file);
         ass_read_styles(track, file, NULL);
         talloc_free(file);
     }
@@ -133,7 +152,7 @@ static void mp_ass_add_default_styles(struct sd *sd, ASS_Track *track, struct mp
         track->default_style = sid;
         ASS_Style *style = track->styles + sid;
         style->Name = strdup("Default");
-        mp_ass_set_style(style, track->PlayResY, opts->sub_style);
+        mp_ass_set_style(style, track->PlayResY, subtitle_style(sd));
     }
 
     if (shared_opts->ass_style_override[sd->order])
@@ -240,7 +259,7 @@ static void enable_output(struct sd *sd, bool enable)
     } else {
         ctx->ass_renderer = ass_renderer_init(ctx->ass_library);
 
-        mp_ass_configure_fonts(ctx->ass_renderer, sd->opts->sub_style,
+        mp_ass_configure_fonts(ctx->ass_renderer, subtitle_style(sd),
                                sd->global, sd->log);
     }
 }
@@ -251,13 +270,13 @@ static void assobjects_init(struct sd *sd)
     struct mp_subtitle_opts *opts = sd->opts;
     struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
 
-    ctx->ass_library = mp_ass_init(sd->global, sd->opts->sub_style, sd->log);
+    ctx->ass_library = mp_ass_init(sd->global, subtitle_style(sd), sd->log);
     ass_set_extract_fonts(ctx->ass_library, opts->use_embedded_fonts);
 
     add_subtitle_fonts(sd);
 
     if (shared_opts->ass_style_override[sd->order])
-        ass_set_style_overrides(ctx->ass_library, opts->ass_style_override_list);
+        ass_set_style_overrides(ctx->ass_library, subtitle_style_overrides(sd));
 
     ctx->ass_track = ass_new_track(ctx->ass_library);
     ctx->ass_track->track_type = TRACK_TYPE_ASS;
@@ -592,12 +611,12 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
 #endif
     ass_set_selective_style_override_enabled(priv, set_force_flags);
     ASS_Style style = {0};
-    mp_ass_set_style(&style, MP_ASS_FONT_PLAYRESY, opts->sub_style);
+    mp_ass_set_style(&style, MP_ASS_FONT_PLAYRESY, subtitle_style(sd));
     ass_set_selective_style_override(priv, &style);
     free(style.FontName);
     if (converted && track->default_style < track->n_styles) {
         mp_ass_set_style(track->styles + track->default_style,
-                         track->PlayResY, opts->sub_style);
+                         track->PlayResY, subtitle_style(sd));
     }
     ass_set_font_scale(priv, set_font_scale);
     ass_set_hinting(priv, set_hinting);
@@ -616,7 +635,7 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
 #endif
     if (converted) {
         bool override_playres = true;
-        char **ass_style_override_list = opts->ass_style_override_list;
+        char **ass_style_override_list = subtitle_style_overrides(sd);
         for (int i = 0; ass_style_override_list && ass_style_override_list[i]; i++) {
             if (bstr_find0(bstr0(ass_style_override_list[i]), "PlayResX") >= 0)
                 override_playres = false;

@@ -526,11 +526,13 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
 
     osd_rescale_bitmaps(res, w, h, d, video_par);
 
-    if (opts->sub_scale != 1.0 && shared_opts->ass_style_override[sd->order]) {
+    float scale = sd->order == 1 && opts->secondary_sub_scale >= 0
+        ? opts->secondary_sub_scale : opts->sub_scale;
+    if (scale != 1.0 && shared_opts->ass_style_override[sd->order]) {
         for (int n = 0; n < res->num_parts; n++) {
             struct sub_bitmap *sub = &res->parts[n];
 
-            float shit = (opts->sub_scale - 1.0f) / 2;
+            float shit = (scale - 1.0f) / 2;
 
             // Fortunately VO isn't supposed to give a FUCKING FUCK about
             // whether the sub might e.g. go outside of the screen.

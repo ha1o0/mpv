@@ -110,6 +110,10 @@ struct mp_subtitle_opts {
     bool sub_scale_with_window;
     bool ass_scale_with_window;
     struct osd_style_opts *sub_style;
+    struct osd_style_opts *secondary_sub_style;
+    int secondary_sub_style_independent;
+    char **secondary_ass_style_override_list;
+    char *secondary_ass_styles_file;
     float sub_scale;
     float secondary_sub_scale;
     bool sub_scale_signs;

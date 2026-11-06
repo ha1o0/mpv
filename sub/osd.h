@@ -85,6 +85,9 @@ struct sub_bitmaps {
     bool video_color_space; // True if the bitmap is in video color space
 };
 
+// Identify the secondary subtitle overlay without exposing OSD internals.
+bool osd_is_secondary_subtitle(const struct sub_bitmaps *bitmaps);
+
 struct sub_bitmap_list {
     // Combined change_id - of any of the existing items change (even if they
     // e.g. go away and are removed from items[]), this is incremented.
@@ -179,6 +182,7 @@ struct osd_bar_style_opts {
 
 extern const struct m_sub_options osd_style_conf;
 extern const struct m_sub_options sub_style_conf;
+extern const struct m_sub_options secondary_sub_style_conf;
 extern const struct m_sub_options osd_bar_style_conf;
 
 struct osd_state;

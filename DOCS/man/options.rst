@@ -2519,11 +2519,47 @@ Subtitles
         rendering. Use with care, or use ``--sub-font-size`` instead.
 
 ``--secondary-sub-scale=<-1-100>``
-    Override the text subtitle font size factor for secondary subtitles.
+    Override the subtitle scale factor for secondary subtitles.
     Negative values (default: -1) inherit ``--sub-scale`` and preserve its
     existing behavior. Nonnegative values select an independent factor and
     do not change primary subtitles. The same ASS override and typesetting
-    rules as ``--sub-scale`` apply. Bitmap subtitles are unaffected.
+    rules as ``--sub-scale`` apply. Bitmap subtitles also use this factor,
+    independently of primary subtitles, when their ASS override mode is enabled.
+
+``--secondary-sub-style=<shared|independent>``
+    Select whether secondary text subtitles share the primary subtitle style
+    (default: ``shared``) or use their own ``--secondary-sub-*`` appearance.
+    Selecting ``independent`` does not change either subtitle track selection.
+    The independent style starts with the same defaults as ``--sub-*``; clients
+    migrating existing preferences can explicitly copy their primary values.
+
+    Independent options have the same values and semantics as their primary
+    counterparts: ``font``, ``font-size``, ``bold``, ``italic``, ``color``,
+    ``border-color``/``outline-color``, ``border-size``/``outline-size``,
+    ``border-style``, ``shadow-offset``, ``back-color``/``shadow-color``,
+    ``blur``, ``spacing``, ``margin-x``, ``margin-y``, ``margin-y-offset``,
+    ``align-x``, ``align-y``, ``justify``, ``font-provider`` and ``fonts-dir``.
+    For example, ``--secondary-sub-font-size=32`` and
+    ``--secondary-sub-shadow-offset=3`` can be changed at runtime independently.
+    Outline and shadow remain separate options and can be used together.
+
+    ``--secondary-sub-ass-style-overrides`` and ``--secondary-sub-ass-styles``
+    likewise replace the primary style override list and style file only in
+    independent mode. The existing ``--secondary-sub-ass-override`` controls
+    whether authored ASS styling is retained, overridden or stripped. Text
+    appearance does not recolor bitmap subtitles such as PGS or VobSub.
+
+``--secondary-sub-hdr-peak=<nits|sdr|shared>``
+    Set secondary text subtitle HDR brightness independently in gpu-next,
+    including the libmpv gpu-next render API. Values match ``--sub-hdr-peak``;
+    ``shared`` (default) follows that option. This is independent of the text
+    style mode above.
+
+``--secondary-image-subs-hdr-peak=<nits|sdr|video|video-static|video-dynamic|shared>``
+    Set secondary bitmap subtitle HDR brightness independently in both gpu-next
+    rendering paths. Values match ``--image-subs-hdr-peak``; ``shared`` (default)
+    follows that option. The shared ``--image-subs-colorspace`` still determines
+    how bitmap palettes are interpreted.
 
 ``--sub-scale-signs=<yes|no>``
     When set to yes, also apply ``--sub-scale`` to typesetting (or "signs").

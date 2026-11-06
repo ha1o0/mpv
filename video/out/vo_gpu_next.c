@@ -177,6 +177,8 @@ static void update_lut(struct priv *p, struct user_lut *lut);
 struct gl_next_opts {
     bool delayed_peak;
     int sub_hdr_peak;
+    int secondary_sub_hdr_peak;
+    int secondary_image_subs_hdr_peak;
     int image_subs_hdr_peak;
     int image_subs_colorspace;
     int border_background;
@@ -205,6 +207,11 @@ const struct m_sub_options gl_next_conf = {
     .opts = (const struct m_option[]) {
         {"sub-hdr-peak", OPT_CHOICE(sub_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE}),
             M_RANGE(10, 10000)},
+        {"secondary-sub-hdr-peak", OPT_CHOICE(secondary_sub_hdr_peak,
+            {"shared", 0}, {"sdr", PL_COLOR_SDR_WHITE}), M_RANGE(10, 10000)},
+        {"secondary-image-subs-hdr-peak", OPT_CHOICE(secondary_image_subs_hdr_peak,
+            {"shared", 0}, {"sdr", PL_COLOR_SDR_WHITE},
+            {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}), M_RANGE(10, 10000)},
         {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
             {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
         {"image-subs-colorspace", OPT_CHOICE(image_subs_colorspace,
@@ -246,16 +253,18 @@ const struct m_sub_options gl_next_conf = {
     .change_flags = UPDATE_VIDEO,
 };
 
-int gpu_next_get_sub_hdr_peak(const struct m_config_cache *cache)
+int gpu_next_get_sub_hdr_peak(const struct m_config_cache *cache, bool secondary)
 {
     const struct gl_next_opts *opts = cache->opts;
-    return opts->sub_hdr_peak;
+    return secondary && opts->secondary_sub_hdr_peak != 0
+        ? opts->secondary_sub_hdr_peak : opts->sub_hdr_peak;
 }
 
-int gpu_next_get_image_subs_hdr_peak(const struct m_config_cache *cache)
+int gpu_next_get_image_subs_hdr_peak(const struct m_config_cache *cache, bool secondary)
 {
     const struct gl_next_opts *opts = cache->opts;
-    return opts->image_subs_hdr_peak;
+    return secondary && opts->secondary_image_subs_hdr_peak != 0
+        ? opts->secondary_image_subs_hdr_peak : opts->image_subs_hdr_peak;
 }
 
 int gpu_next_get_image_subs_colorspace(const struct m_config_cache *cache)
@@ -358,6 +367,9 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
         const struct sub_bitmaps *item = subs->items[n];
         if (!item->num_parts || !item->packed)
             continue;
+        bool secondary = osd_is_secondary_subtitle(item);
+        int sub_hdr_peak = gpu_next_get_sub_hdr_peak(p->next_opts_cache, secondary);
+        int image_subs_hdr_peak = gpu_next_get_image_subs_hdr_peak(p->next_opts_cache, secondary);
         struct osd_entry *entry = &state->entries[item->render_index];
         pl_fmt tex_fmt = p->osd_fmt[item->format];
         if (!entry->tex)
@@ -436,8 +448,8 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 // or for SDR video in auto mode.
                 ol->color = src->params.color;
                 if (pl_color_transfer_is_hdr(ol->color.transfer)) {
-                    bool use_static = p->next_opts->image_subs_hdr_peak == -2;
-                    if (use_static || p->next_opts->image_subs_hdr_peak == -3) {
+                    bool use_static = image_subs_hdr_peak == -2;
+                    if (use_static || image_subs_hdr_peak == -3) {
                         float max;
                         pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
                             .color      = &ol->color,
@@ -448,9 +460,9 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                         ol->color.hdr = (struct pl_hdr_metadata) {
                             .max_luma = max,
                         };
-                    } else if (p->next_opts->image_subs_hdr_peak != -1) {
+                    } else if (image_subs_hdr_peak != -1) {
                         ol->color.hdr = (struct pl_hdr_metadata) {
-                            .max_luma = p->next_opts->image_subs_hdr_peak,
+                            .max_luma = image_subs_hdr_peak,
                         };
                     }
                 }
@@ -458,7 +470,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 // Bitmap subtitles are normally authored as SDR graphics. Do
                 // not make PGS/VobSub/DVB bitmaps inherit PQ/HLG/Dolby Vision
                 // transfer metadata when SDR or auto mode selects sRGB.
-                int peak = p->next_opts->image_subs_hdr_peak;
+                int peak = image_subs_hdr_peak;
                 ol->color = pl_color_space_srgb;
                 ol->color.hdr.max_luma = peak >= 10
                     ? peak : PL_COLOR_SDR_WHITE;
@@ -474,7 +486,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
                 // configured subtitle diffuse white instead of silently
                 // falling back to untagged SDR metadata.
                 ol->color.hdr = (struct pl_hdr_metadata) {
-                    .max_luma = p->next_opts->sub_hdr_peak,
+                    .max_luma = sub_hdr_peak,
                 };
             }
             ol->mode = PL_OVERLAY_MONOCHROME;
